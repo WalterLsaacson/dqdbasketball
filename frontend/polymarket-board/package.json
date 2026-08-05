@@ -1,0 +1,7 @@
+{
+  "name": "@polymarket/basketball-board",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Demo frontend for the polymarket-basketball Cursor skill",
+  "type": "module"
+}

@@ -1,0 +1,5 @@
+# Optional deps for in-process CLOB trading (polymarket-quote).
+# Aligns with simple_str: py-clob-client-v2 (CLOB V2), not archived py-clob-client.
+py-clob-client-v2>=1.0
+python-dotenv>=1.0
+eth-account>=0.10

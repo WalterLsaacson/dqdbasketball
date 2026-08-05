@@ -1,0 +1,150 @@
+:root {
+  --bg0: #0e1412;
+  --bg1: #15201b;
+  --ink: #e8f0ea;
+  --muted: #8aa194;
+  --line: rgba(232, 240, 234, 0.12);
+  --accent: #6fbf8a;
+  --warn: #d4a35c;
+  --down: #c47a6a;
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --font-body: "Avenir Next", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(111, 191, 138, 0.16), transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, rgba(212, 163, 92, 0.1), transparent 50%),
+    linear-gradient(180deg, var(--bg1), var(--bg0));
+  color: var(--ink);
+  font-family: var(--font-body);
+}
+
+.hero {
+  padding: 3.5rem 1.5rem 1.25rem;
+  max-width: 920px;
+  margin: 0 auto;
+}
+
+.brand {
+  margin: 0 0 0.35rem;
+  font-family: var(--font-display);
+  font-size: clamp(2.4rem, 6vw, 3.6rem);
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.sub {
+  margin: 0.75rem 0 0;
+  color: var(--muted);
+  max-width: 36rem;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 0 1.5rem 1.25rem;
+}
+
+.pill {
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--line);
+  background: rgba(14, 20, 18, 0.45);
+  font-size: 0.85rem;
+}
+
+.pill.ok {
+  border-color: rgba(111, 191, 138, 0.45);
+  color: var(--accent);
+}
+
+.pill.bad {
+  border-color: rgba(196, 122, 106, 0.5);
+  color: var(--down);
+}
+
+.pill.muted {
+  color: var(--muted);
+}
+
+.grid {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 0 1.5rem 3rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.empty {
+  color: var(--muted);
+  padding: 2rem 0;
+}
+
+.card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 1rem 1.1rem;
+  border-top: 1px solid var(--line);
+  text-decoration: none;
+  color: inherit;
+  transition: background 160ms ease, transform 160ms ease;
+}
+
+.card:hover {
+  background: rgba(232, 240, 234, 0.04);
+  transform: translateY(-1px);
+}
+
+.card h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.45rem;
+  font-weight: 500;
+}
+
+.card .skill {
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.card .go {
+  color: var(--accent);
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+}
+
+.card.is-down h2 {
+  color: var(--muted);
+}
+
+.card.is-down .go {
+  color: var(--down);
+}
+
+@media (max-width: 640px) {
+  .hero {
+    padding-top: 2.25rem;
+  }
+}

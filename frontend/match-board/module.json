@@ -1,0 +1,32 @@
+{
+  "id": "match-board",
+  "name": "DQD Match Board",
+  "version": "1.0.0",
+  "kind": "frontend",
+  "status": "stable",
+  "skill": "dongqiudi-basketball",
+  "entry": {
+    "html": "public/index.html",
+    "js": "src/main.js",
+    "css": "src/styles.css",
+    "server": "server/app.py"
+  },
+  "api": {
+    "base": "/",
+    "routes": [
+      "GET /api/health",
+      "GET /api/matches?tab=",
+      "GET /api/status",
+      "GET /api/watch/once?tab=",
+      "GET /api/events",
+      "POST /api/watch/start",
+      "POST /api/watch/stop"
+    ]
+  },
+  "defaults": {
+    "host": "127.0.0.1",
+    "port": 8887,
+    "tab": "full",
+    "language": "en"
+  }
+}

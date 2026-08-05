@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="pm-module" content="polymarket-board" />
+    <title>Polymarket Soccer Board</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true"></div>
+    <header class="top">
+      <div class="brand">
+        <span class="brand__mark">PM</span>
+        <div>
+          <h1 class="brand__title">Polymarket Board</h1>
+          <p class="brand__sub">
+            Module <code>@polymarket/basketball-board</code> · skill
+            <code>polymarket-basketball</code> · 默认<strong>未来 48 小时</strong> · 北京时间
+          </p>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="toggles">
+          <label class="toggle">
+            <input id="chkWindow" type="checkbox" checked />
+            <span>Next 48h</span>
+          </label>
+          <label class="toggle">
+            <input id="chkClosed" type="checkbox" />
+            <span>Include closed</span>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="btnRefresh" class="btn btn--ghost" type="button">Refresh</button>
+          <button id="btnStart" class="btn btn--primary" type="button">Start Skill</button>
+          <button id="btnStop" class="btn btn--danger" type="button" disabled>Stop</button>
+        </div>
+      </div>
+    </header>
+
+    <section class="meta" id="meta">
+      <div class="pill" id="pillStatus">Idle</div>
+      <div class="pill pill--muted" id="pillWindow">window —</div>
+      <div class="pill pill--muted" id="pillCount">— matches</div>
+      <div class="pill pill--muted" id="pillLeagues">— leagues</div>
+      <div class="pill pill--muted" id="pillProxy">proxy —</div>
+      <div class="pill pill--muted" id="pillFetched">—</div>
+      <div class="pill pill--muted" id="pillTz">UTC+8 北京时间</div>
+    </section>
+
+    <main class="layout">
+      <aside class="league-rail" id="leagueRail" aria-label="Leagues"></aside>
+      <section class="board" id="board">
+        <div class="empty" id="empty">Refresh 读本地缓冲；Start Skill 才周期性拉 Gamma…</div>
+      </section>
+    </main>
+
+    <script src="/src/main.js" type="module"></script>
+  </body>
+</html>

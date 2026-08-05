@@ -1,0 +1,29 @@
+{
+  "id": "main",
+  "name": "System Main",
+  "version": "1.0.0",
+  "kind": "orchestrator",
+  "status": "stable",
+  "skill": "polymarket-quote",
+  "description": "Master entry: basketball quote watch and in-process CLOB trade → match-bridge → DQD + Polymarket boards.",
+  "entry": {
+    "html": "public/index.html",
+    "js": "src/main.js",
+    "css": "src/styles.css",
+    "server": "server/app.py"
+  },
+  "children": [
+    { "id": "match-board", "port": 8887, "skill": "dongqiudi-basketball" },
+    { "id": "polymarket-board", "port": 8888, "skill": "polymarket-basketball" },
+    { "id": "bridge-board", "port": 8889, "skill": "match-bridge" },
+    {
+      "id": "polymarket-quote",
+      "kind": "skill",
+      "via": "pm_quote.py watch (+ trade dry-run/live)"
+    }
+  ],
+  "defaults": {
+    "host": "127.0.0.1",
+    "port": 8890
+  }
+}

@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+*.iml
+
+# Runtime state — ignore everything under data, keep folder placeholders
+/data/**
+!/data/
+!/data/**/
+!/data/.gitkeep
+!/data/**/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/

@@ -1,0 +1,34 @@
+{
+  "id": "polymarket-board",
+  "name": "Polymarket Basketball Board",
+  "version": "1.0.0",
+  "kind": "frontend",
+  "status": "demo",
+  "skill": "polymarket-basketball",
+  "entry": {
+    "html": "public/index.html",
+    "js": "src/main.js",
+    "css": "src/styles.css",
+    "server": "server/app.py"
+  },
+  "api": {
+    "base": "/",
+    "routes": [
+      "GET /api/health",
+      "GET /api/module",
+      "GET /api/status",
+      "GET /api/leagues",
+      "GET /api/matches?league=&include_closed=&within_hours=",
+      "POST /api/fetch/once",
+      "POST /api/fetch/start",
+      "POST /api/fetch/stop"
+    ]
+  },
+  "defaults": {
+    "host": "127.0.0.1",
+    "port": 8888,
+    "league": "all",
+    "within_hours": 48,
+    "interval": 600
+  }
+}

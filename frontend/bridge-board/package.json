@@ -1,0 +1,7 @@
+{
+  "name": "@dongqiudi-basket/bridge-board",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Demo frontend for the match-bridge Cursor skill",
+  "type": "module"
+}

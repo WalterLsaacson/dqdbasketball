@@ -1,0 +1,31 @@
+{
+  "id": "bridge-board",
+  "name": "Match Bridge Board",
+  "version": "1.0.0",
+  "kind": "frontend",
+  "status": "demo",
+  "skill": "match-bridge",
+  "entry": {
+    "html": "public/index.html",
+    "js": "src/main.js",
+    "css": "src/styles.css",
+    "server": "server/app.py"
+  },
+  "api": {
+    "base": "/",
+    "routes": [
+      "GET /api/health",
+      "GET /api/module",
+      "GET /api/status",
+      "GET /api/matches",
+      "POST /api/bridge/once",
+      "POST /api/bridge/start",
+      "POST /api/bridge/stop"
+    ]
+  },
+  "defaults": {
+    "host": "127.0.0.1",
+    "port": 8889,
+    "tab": "full"
+  }
+}

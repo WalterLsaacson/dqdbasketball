@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="bridge-module" content="bridge-board" />
+    <title>Match Bridge Board</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Space+Grotesk:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true"></div>
+    <header class="top">
+      <div class="brand">
+        <span class="brand__mark">MB</span>
+        <div>
+          <h1 class="brand__title">Match Bridge</h1>
+          <p class="brand__sub">
+            <code>match-bridge</code> · 懂球帝比分进度 ↔ Polymarket 盘口 · 北京时间
+          </p>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="actions">
+          <button id="btnRefresh" class="btn btn--ghost" type="button">Refresh</button>
+          <button id="btnStart" class="btn btn--primary" type="button">Start Bridge</button>
+          <button id="btnStop" class="btn btn--danger" type="button" disabled>Stop</button>
+        </div>
+      </div>
+    </header>
+
+    <section class="meta" id="meta">
+      <div class="pill" id="pillStatus">Idle</div>
+      <div class="pill pill--muted" id="pillCount">— matched</div>
+      <div class="pill pill--muted" id="pillLive">Live —</div>
+      <div class="pill pill--muted" id="pillFt">FT —</div>
+      <div class="pill pill--muted" id="pillUpstream">DQD — · PM —</div>
+      <div class="pill pill--muted" id="pillFetched">—</div>
+      <div class="pill pill--muted">伤停补时 + 墙钟</div>
+    </section>
+
+    <main class="layout">
+      <aside class="league-rail" id="leagueRail" aria-label="Leagues"></aside>
+      <section class="board" id="board">
+        <div class="empty">Loading match-bridge snapshot…</div>
+      </section>
+    </main>
+
+    <div class="toast-stack" id="toasts" aria-live="polite"></div>
+
+    <script src="/src/main.js" type="module"></script>
+  </body>
+</html>

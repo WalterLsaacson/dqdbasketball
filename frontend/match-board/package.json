@@ -1,0 +1,18 @@
+{
+  "name": "@dongqiudi-basket/match-board",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Official Match Board frontend module. Consumes the dongqiudi-basketball skill for basketball tabs, scores, league colors, and live score-change events.",
+  "type": "module",
+  "scripts": {
+    "start": "python3 ../run.py",
+    "dev": "python3 ../run.py"
+  },
+  "dongqiudi": {
+    "module": "match-board",
+    "skill": "dongqiudi-basketball",
+    "entry": "public/index.html",
+    "server": "server/app.py",
+    "port": 8887
+  }
+}
