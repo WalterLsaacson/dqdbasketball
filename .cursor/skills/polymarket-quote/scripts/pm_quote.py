@@ -17,6 +17,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -247,7 +248,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         rt,
         market_cache=cache,
         retain_hours=retain_h,
-        interval_s=600.0,
+        interval_s=3600.0,
         stop_event=stop_warm,
         run_immediately=True,
     )
@@ -268,6 +269,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     sig = mcache.file_signature(events_path)
     owned = lib.get_owned_bridge()
     first_tick = True
+    # 0.0 makes the first tick trim: a restart on a bloated log reclaims
+    # space immediately instead of waiting a full trim interval.
+    last_bridge_trim = 0.0
     try:
         while True:
             mem_events: list = []
@@ -293,6 +297,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 market_cache=cache,
                 events_override=mem_events if mem_events else None,
             )
+            # Trim the bridge log from the consumer side, after the cursor was
+            # saved by process_bridge_events: only this thread knows which
+            # bytes are already handled, and it rebases events_byte_offset by
+            # the same amount it drops. Rate-limited so a busy tick does not
+            # copy the tail on every score change.
+            if time.monotonic() - last_bridge_trim >= 300.0:
+                last_bridge_trim = time.monotonic()
+                try:
+                    trim = data_prune.prune_bridge_consumed(rt)
+                    if trim.get("pruned"):
+                        print(
+                            f"bridge log -> {'rotated' if trim.get('rotated') else 'trimmed'} "
+                            f"prefix={int(trim.get('removed_bytes') or 0) / 1024**2:.1f}MB "
+                            f"live={int(trim.get('live_bytes') or 0) / 1024**2:.1f}MB",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"bridge log trim failed: {exc}", file=sys.stderr, flush=True)
             for b in bundles:
                 lat = b.get("latency_ms") or {}
                 lat_s = ""
