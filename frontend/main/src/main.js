@@ -14,14 +14,15 @@ function render(st) {
   const trade = st.quote?.trade || {};
   const mode = trade.mode || "off";
   const depth = trade.take_depth || "top";
+  const terms = `FAK $${trade.max_usdc ?? "?"} · rest $${trade.rest_usdc ?? "?"} @0.99 · exit @0.999`;
   if (mode === "off") {
     $("pillTrade").textContent = "Trade off";
     $("pillTrade").className = "pill muted";
   } else if (mode === "live") {
-    $("pillTrade").textContent = `Trade LIVE · ${depth} · $${trade.max_usdc ?? "?"}`;
+    $("pillTrade").textContent = `Trade LIVE · ${depth} · ${terms}`;
     $("pillTrade").className = "pill ok";
   } else {
-    $("pillTrade").textContent = `Trade dry-run · ${depth} · $${trade.max_usdc ?? "?"}`;
+    $("pillTrade").textContent = `Trade dry-run · ${depth} · ${terms}`;
     $("pillTrade").className = "pill ok";
   }
 
@@ -39,7 +40,14 @@ function render(st) {
     up: true,
   };
 
-  const items = [hub, ...boards];
+  const ledger = {
+    id: "trades-ledger",
+    name: "Trades Ledger",
+    skill: "trades.jsonl · open positions",
+    url: `${st.hub.replace(/\/$/, "")}/trades`,
+    up: true,
+  };
+  const items = [hub, ledger, ...boards];
   $("grid").innerHTML = items
     .map((b) => {
       const detail =
@@ -49,7 +57,7 @@ function render(st) {
             (b.pm_ticks != null ? ` · PM ${b.pm_ticks}` : "")
           : "";
       return `
-      <a class="card ${b.up ? "" : "is-down"}" href="${b.url}" target="_blank" rel="noreferrer">
+      <a class="card ${b.up ? "" : "is-down"}" href="${b.url}" target="${b.id === "trades-ledger" ? "_self" : "_blank"}" rel="noreferrer">
         <div>
           <h2>${b.name || b.id}</h2>
           <p class="skill">${b.skill || ""}${detail}</p>

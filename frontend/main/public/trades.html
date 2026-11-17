@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Basketball Trades Ledger</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <header class="hero hero--tight">
+      <p class="brand"><a class="brand-link" href="/">Dongqiudi Basketball</a></p>
+      <h1>Trades Ledger</h1>
+      <p class="sub">
+        只读浓缩 <code>trades.jsonl</code> · 原文件格式不变 · 点行展开完整 JSON
+      </p>
+    </header>
+
+    <section class="meta" id="meta">
+      <div class="pill" id="pillCount">—</div>
+      <div class="pill muted" id="pillOpens">Opens —</div>
+      <div class="pill muted" id="pillFresh">—</div>
+    </section>
+
+    <section class="filters" id="filters">
+      <input id="q" type="search" placeholder="搜球队 / market / status…" />
+      <select id="trade">
+        <option value="">全部 trade</option>
+        <option value="buy_win">buy_win</option>
+        <option value="rest_buy">rest_buy</option>
+        <option value="flatten_reversal">flatten_reversal</option>
+        <option value="sell_lose">sell_lose</option>
+      </select>
+      <select id="status">
+        <option value="">全部 status</option>
+        <option value="posted">posted</option>
+        <option value="dry_run">dry_run</option>
+        <option value="skipped">skipped</option>
+        <option value="error">error</option>
+        <option value="flatten_posted">flatten_posted</option>
+        <option value="flatten_dry_run">flatten_dry_run</option>
+      </select>
+      <select id="live">
+        <option value="">live + dry</option>
+        <option value="1">仅 LIVE</option>
+        <option value="0">仅 dry</option>
+      </select>
+      <select id="hours">
+        <option value="">全部时间</option>
+        <option value="6">近 6h</option>
+        <option value="12">近 12h</option>
+        <option value="24" selected>近 24h</option>
+        <option value="72">近 3d</option>
+      </select>
+      <select id="limit">
+        <option value="80">80 行</option>
+        <option value="200" selected>200 行</option>
+        <option value="500">500 行</option>
+      </select>
+      <button id="btnRefresh" class="btn" type="button">Refresh</button>
+    </section>
+
+    <main class="ledger-wrap">
+      <div class="ledger-scroll">
+        <table class="ledger" id="table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>模式</th>
+              <th>状态</th>
+              <th>方向</th>
+              <th>比赛</th>
+              <th>盘口</th>
+              <th>边</th>
+              <th>$</th>
+              <th>备注</th>
+            </tr>
+          </thead>
+          <tbody id="tbody">
+            <tr>
+              <td colspan="9" class="empty">Loading…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <aside class="detail" id="detail">
+        <p class="detail-hint">点一行查看完整原始 JSON（不改文件）。</p>
+      </aside>
+    </main>
+
+    <script src="/src/trades.js" type="module"></script>
+  </body>
+</html>

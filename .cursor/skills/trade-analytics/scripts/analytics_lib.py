@@ -196,6 +196,22 @@ def compact_trade(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def trade_note(row: dict[str, Any]) -> str:
+    """Short ledger explanation without changing the source trade record."""
+    reason = str(row.get("skip_reason") or "")
+    if reason:
+        return reason[:180]
+    trade = str(row.get("trade") or "")
+    status = str(row.get("status") or "")
+    if trade == "rest_buy":
+        return "0.99 休眠买单" if status == "posted" else "计划挂 0.99 买单"
+    if trade == "buy_win":
+        return "已买入结算胜出份额" if status == "posted" else "计划买入胜出份额"
+    if "flatten" in trade:
+        return "比分回撤平仓"
+    return str(row.get("market_key") or "")[:180]
+
+
 def load_open_positions(path: Path) -> list[dict[str, Any]]:
     raw = load_json(path, {})
     if isinstance(raw, list):

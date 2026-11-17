@@ -16,13 +16,17 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 MODULE_DIR = Path(__file__).resolve().parents[1]
 FRONTEND = MODULE_DIR.parent
 ROOT = FRONTEND.parent
 PUBLIC = MODULE_DIR / "public"
 SRC = MODULE_DIR / "src"
+ANALYTICS_SCRIPTS = ROOT / ".cursor" / "skills" / "trade-analytics" / "scripts"
+if str(ANALYTICS_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(ANALYTICS_SCRIPTS))
+import analytics_lib as _ta  # noqa: E402
 
 HOST = "127.0.0.1"
 PORT = 8890
@@ -146,6 +150,7 @@ def load_quote_trade_config(
         "max_usdc": float(
             max_usdc if max_usdc is not None else os.getenv("QUOTE_MAX_USDC", "20")
         ),
+        "rest_usdc": float(os.getenv("QUOTE_REST_USDC", "5") or "5"),
         "max_shares": float(
             max_shares if max_shares is not None else os.getenv("QUOTE_MAX_SHARES", "25")
         ),
@@ -573,6 +578,79 @@ def status() -> dict[str, Any]:
     }
 
 
+def _q(qs: dict[str, list[str]], key: str) -> str:
+    return str((qs.get(key) or [""])[0]).strip()
+
+
+def trades_ledger_payload(qs: dict[str, list[str]]) -> dict[str, Any]:
+    path = ROOT / "data" / "pm-quote" / "trades.jsonl"
+    rows = _ta.load_jsonl(path)
+    try:
+        hours = float(_q(qs, "last_hours")) if _q(qs, "last_hours") else None
+        if hours is not None and hours < 0:
+            hours = None
+    except ValueError:
+        hours = None
+    since, until = _ta.resolve_window(
+        since=_q(qs, "since") or None, until=_q(qs, "until") or None,
+        last_hours=hours,
+    )
+    rows = _ta.filter_window(rows, since=since, until=until)
+    trade = _q(qs, "trade")
+    status_filter = _q(qs, "status")
+    family = _q(qs, "family")
+    match_id = _q(qs, "match_id")
+    live = _q(qs, "live")
+    needle = _q(qs, "q").casefold()
+    if trade:
+        rows = [r for r in rows if str(r.get("trade") or "") == trade]
+    if status_filter:
+        rows = [r for r in rows if str(r.get("status") or "") == status_filter]
+    if family:
+        rows = [r for r in rows if str(r.get("family") or "") == family]
+    if match_id:
+        rows = [r for r in rows if str(r.get("match_id") or "") == match_id]
+    if live in ("0", "1"):
+        rows = [r for r in rows if bool(r.get("live")) == (live == "1")]
+    if needle:
+        fields = ("home", "away", "market_key", "outcome", "status", "trade", "match_id", "skip_reason")
+        rows = [r for r in rows if needle in " ".join(str(r.get(f) or "") for f in fields).casefold()]
+    try:
+        limit = max(1, min(500, int(_q(qs, "limit") or "200")))
+    except ValueError:
+        limit = 200
+    total = len(rows)
+    selected = list(reversed(rows[-limit:]))
+    compact = []
+    for row in selected:
+        item = _ta.compact_trade(row)
+        item["idempotency_key"] = row.get("idempotency_key")
+        item["note"] = _ta.trade_note(row)
+        compact.append(item)
+    positions = _ta.load_open_positions(ROOT / "data" / "pm-quote" / "open_positions.json")
+    open_rows = [r for r in positions if r.get("status") == "open" and float(r.get("shares") or 0) > 0]
+    return {
+        "ok": True, "analyzed_at": _ta.now_cn_iso(),
+        "total_matched": total, "returned": len(compact), "trades": compact,
+        "opens": {
+            "open": len(open_rows),
+            "open_usdc": round(sum(float(r.get("usdc") or 0) for r in open_rows), 4),
+            "total": len(positions),
+        },
+    }
+
+
+def trade_detail_payload(qs: dict[str, list[str]]) -> dict[str, Any]:
+    key = _q(qs, "idempotency_key")
+    if not key:
+        return {"ok": False, "error": "missing idempotency_key"}
+    rows = _ta.load_jsonl(ROOT / "data" / "pm-quote" / "trades.jsonl")
+    for row in reversed(rows):
+        if str(row.get("idempotency_key") or "") == key:
+            return {"ok": True, "compact": _ta.compact_trade(row), "raw": row}
+    return {"ok": False, "error": "trade not found"}
+
+
 def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(code)
@@ -606,9 +684,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             json_response(self, 200, status())
             return
+        if path == "/api/trades":
+            json_response(self, 200, trades_ledger_payload(parse_qs(parsed.query)))
+            return
+        if path == "/api/trades/detail":
+            payload = trade_detail_payload(parse_qs(parsed.query))
+            json_response(self, 200 if payload["ok"] else 404, payload)
+            return
 
         if path == "/" or path == "/index.html":
             return self._file(PUBLIC / "index.html", "text/html; charset=utf-8")
+        if path == "/trades" or path == "/trades.html":
+            return self._file(PUBLIC / "trades.html", "text/html; charset=utf-8")
         if path.startswith("/src/"):
             rel = path[len("/src/") :]
             fp = SRC / rel
