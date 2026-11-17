@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from exit_sell import note_exit_fill
 
 logger = logging.getLogger("pm_quote.reversal")
 
@@ -155,10 +158,12 @@ class OpenPositionLedger:
         open_rows = [r for r in self._rows if r.get("status") == "open"]
         closed = [r for r in self._rows if r.get("status") != "open"][-200:]
         payload = {"positions": open_rows + closed}
-        self.path.write_text(
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        os.replace(tmp, self.path)
 
     def register_buy(
         self,
@@ -175,6 +180,8 @@ class OpenPositionLedger:
         home: str = "",
         away: str = "",
         family: str = "",
+        market_id: str = "",
+        condition_id: str = "",
         tick_size: str = "0.01",
         neg_risk: bool | None = None,
         af_status: str = AF_STATUS_NONE,
@@ -183,6 +190,8 @@ class OpenPositionLedger:
     ) -> None:
         if not match_id or not token_id or shares <= 0:
             return
+        added_shares = float(shares)
+        entry_price = float(usdc) / added_shares
         sc = score_pair(home_score, away_score)
         status = str(af_status or AF_STATUS_NONE)
         if status not in (AF_STATUS_PENDING, AF_STATUS_CONFIRMED, AF_STATUS_NONE):
@@ -225,10 +234,13 @@ class OpenPositionLedger:
                     (existing.get("entry_score") or [None, None])[1],
                 ) or sc
         row = {
+            **(existing or {}),
             "status": "open",
             "match_id": str(match_id),
             "token_id": str(token_id),
             "market_key": market_key or str(existing.get("market_key") if existing else ""),
+            "market_id": market_id or str(existing.get("market_id") if existing else ""),
+            "condition_id": condition_id or str(existing.get("condition_id") if existing else ""),
             "family": family or str(existing.get("family") if existing else ""),
             "shares": float(shares),
             "usdc": float(usdc),
@@ -243,6 +255,7 @@ class OpenPositionLedger:
             "af_deadline": af_deadline if status == AF_STATUS_PENDING else None,
             "fill_status": fill,
         }
+        note_exit_fill(row, added_shares, entry_price)
         if existing is not None and existing.get("pending_flatten"):
             row["pending_flatten"] = True
             row["pending_reason"] = existing.get("pending_reason")
@@ -282,6 +295,58 @@ class OpenPositionLedger:
             for r in self._rows
             if r.get("status") == "open" and str(r.get("match_id")) == mid
         ]
+
+    def market_buy_commitment_usdc(
+        self, *, match_id: str, market_key: str, token_id: str = "",
+        market_id: str = "", condition_id: str = "",
+    ) -> float:
+        """Filled buys plus unfilled rest bids for one match and market.
+
+        A rest fill moves cost from the working order into the lot's ``usdc``;
+        counting only its unfilled remainder avoids double counting.
+        """
+        mid = str(match_id or "")
+        key = str(market_key or "")
+        tid = str(token_id or "")
+        market = str(market_id or "")
+        condition = str(condition_id or "")
+        if not mid or not (condition or market or key or tid):
+            return 0.0
+        total = 0.0
+        for row in self._rows:
+            if str(row.get("match_id") or "") != mid:
+                continue
+            row_key = str(row.get("market_key") or "")
+            row_market = str(row.get("market_id") or "")
+            row_condition = str(row.get("condition_id") or "")
+            if condition and row_condition:
+                same_market = row_condition == condition
+            elif market and row_market:
+                same_market = row_market == market
+            elif key and row_key:
+                # Older ledger rows only stored the market key.
+                same_market = row_key == key
+            else:
+                same_market = str(row.get("token_id") or "") == tid
+            if not same_market:
+                continue
+            if row.get("status") == "open":
+                total += max(0.0, float(row.get("usdc") or 0))
+            # A remote bid must remain reserved even if its lot was marked closed.
+            for order in row.get("rest_orders") or []:
+                if isinstance(order, dict) and rest_order_is_live(order):
+                    total += rest_order_working_usdc(order)
+        return total
+
+    def invalidated_market(self, token_id: str, match_id: str) -> bool:
+        """Do not rebuild a dry-run lot rejected after a market-mapping audit."""
+        return any(
+            r.get("status") == "closed"
+            and r.get("close_reason") == "invalid_market_mapping"
+            and str(r.get("token_id")) == str(token_id)
+            and str(r.get("match_id")) == str(match_id)
+            for r in self._rows
+        )
 
     def af_pending_lots(
         self,
@@ -425,6 +490,242 @@ class OpenPositionLedger:
             if r.get("status") == "open" and r.get("pending_flatten")
         ]
 
+    def rest_reserved_usdc(
+        self,
+        *,
+        token_id: str = "",
+        match_id: str = "",
+        base_event_key: str = "",
+    ) -> float:
+        """USDC still working on live GTC/GTD bids (not yet matched)."""
+        tid = str(token_id or "")
+        mid = str(match_id or "")
+        base = str(base_event_key or "")
+        total = 0.0
+        for row in self._rows:
+            if row.get("status") != "open":
+                continue
+            if tid and str(row.get("token_id") or "") != tid:
+                continue
+            if mid and str(row.get("match_id") or "") != mid:
+                continue
+            if base and str(row.get("event_key") or "") != base:
+                continue
+            for order in row.get("rest_orders") or []:
+                if not isinstance(order, dict):
+                    continue
+                if not rest_order_is_live(order):
+                    continue
+                total += rest_order_working_usdc(order)
+        return total
+
+    def live_rest_orders(
+        self,
+        *,
+        match_id: str = "",
+        token_id: str = "",
+        keep_token_ids: set[str] | None = None,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """(lot, rest_order) pairs still working on the book."""
+        mid = str(match_id or "")
+        tid = str(token_id or "")
+        keep = keep_token_ids
+        out: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for row in self._rows:
+            if row.get("status") != "open":
+                continue
+            if mid and str(row.get("match_id") or "") != mid:
+                continue
+            row_tid = str(row.get("token_id") or "")
+            if tid and row_tid != tid:
+                continue
+            if keep is not None and row_tid in keep:
+                continue
+            for order in row.get("rest_orders") or []:
+                if isinstance(order, dict) and rest_order_is_live(order):
+                    out.append((row, order))
+        return out
+
+    def add_rest_order(
+        self,
+        *,
+        match_id: str,
+        token_id: str,
+        order: dict[str, Any],
+        market_key: str = "",
+        market_id: str = "",
+        condition_id: str = "",
+        family: str = "",
+        event_key: str = "",
+        home: str = "",
+        away: str = "",
+        home_score: Any = None,
+        away_score: Any = None,
+        live: bool = True,
+        tick_size: str = "0.01",
+        neg_risk: bool | None = None,
+    ) -> None:
+        """Attach a live rest bid to the match+token lot (creates a 0-share lot)."""
+        mid, tid = str(match_id), str(token_id)
+        if not mid or not tid or not isinstance(order, dict):
+            return
+        existing = None
+        for row in self._rows:
+            if (
+                row.get("status") == "open"
+                and str(row.get("match_id")) == mid
+                and str(row.get("token_id")) == tid
+            ):
+                existing = row
+                break
+        if existing is None:
+            sc = score_pair(home_score, away_score)
+            existing = {
+                "status": "open",
+                "match_id": mid,
+                "token_id": tid,
+                "market_key": market_key,
+                "market_id": market_id,
+                "condition_id": condition_id,
+                "family": family,
+                "shares": 0.0,
+                "usdc": 0.0,
+                "entry_score": list(sc) if sc else None,
+                "home": home,
+                "away": away,
+                "live": bool(live),
+                "event_key": event_key,
+                "tick_size": tick_size or "0.01",
+                "neg_risk": neg_risk,
+                "fill_status": FILL_STATUS_OPEN,
+                "rest_orders": [],
+            }
+            self._rows.append(existing)
+        orders = list(existing.get("rest_orders") or [])
+        orders.append(dict(order))
+        existing["rest_orders"] = orders
+        existing["market_id"] = market_id or str(existing.get("market_id") or "")
+        existing["condition_id"] = condition_id or str(existing.get("condition_id") or "")
+        self._save()
+
+    def update_rest_order(
+        self,
+        *,
+        match_id: str,
+        token_id: str,
+        order_id: str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        mid, tid, oid = str(match_id), str(token_id), str(order_id or "")
+        if not oid:
+            return None
+        for row in self._rows:
+            if (
+                row.get("status") != "open"
+                or str(row.get("match_id")) != mid
+                or str(row.get("token_id")) != tid
+            ):
+                continue
+            for order in row.get("rest_orders") or []:
+                if not isinstance(order, dict):
+                    continue
+                if str(order.get("order_id") or "") != oid:
+                    continue
+                order.update(fields)
+                self._save()
+                return dict(order)
+        return None
+
+    def apply_rest_fill(
+        self, *, match_id: str, token_id: str, order_id: str,
+        filled_shares: float, filled_usdc: float, status: str,
+    ) -> float:
+        """Book an order's newly matched shares and cursor in one ledger save."""
+        for row, order in self.live_rest_orders(match_id=match_id, token_id=token_id):
+            if str(order.get("order_id") or "") != str(order_id):
+                continue
+            old_shares = float(order.get("filled_shares") or 0)
+            old_usdc = float(order.get("filled_usdc") or 0)
+            delta = max(0.0, float(filled_shares) - old_shares)
+            cost = max(0.0, float(filled_usdc) - old_usdc)
+            if delta > 0:
+                row["shares"] = float(row.get("shares") or 0) + delta
+                row["usdc"] = float(row.get("usdc") or 0) + cost
+                row["fill_status"] = FILL_STATUS_OPEN
+                note_exit_fill(row, delta, cost / delta if delta else 0)
+            order["filled_shares"] = max(old_shares, float(filled_shares))
+            order["filled_usdc"] = max(old_usdc, float(filled_usdc))
+            order["status"] = status
+            self._save()
+            return delta
+        return 0.0
+
+    def add_exit_order(self, *, match_id: str, token_id: str,
+                       order_id: str, shares: float, price: float) -> None:
+        for row in self.open_for_match(match_id):
+            if str(row.get("token_id") or "") != str(token_id):
+                continue
+            row.setdefault("exit_orders", []).append({
+                "order_id": str(order_id), "shares": float(shares),
+                "price": float(price), "filled_shares": 0.0, "status": "LIVE",
+            })
+            row["exit_listed_shares"] = float(row.get("exit_listed_shares") or 0) + float(shares)
+            self._save()
+            return
+
+    def apply_exit_fill(self, *, match_id: str, token_id: str,
+                        order_id: str, filled_shares: float, status: str) -> float:
+        for row in self.open_for_match(match_id):
+            if str(row.get("token_id") or "") != str(token_id):
+                continue
+            for order in row.get("exit_orders") or []:
+                if str(order.get("order_id") or "") != str(order_id):
+                    continue
+                old = float(order.get("filled_shares") or 0)
+                delta = max(0.0, float(filled_shares) - old)
+                if delta:
+                    before = float(row.get("shares") or 0)
+                    row["shares"] = max(0.0, before - delta)
+                    row["usdc"] = max(0.0, float(row.get("usdc") or 0) * (row["shares"] / before)) if before else 0.0
+                    row["exit_eligible_shares"] = max(0.0, float(row.get("exit_eligible_shares") or 0) - delta)
+                    row["exit_listed_shares"] = max(0.0, float(row.get("exit_listed_shares") or 0) - delta)
+                order["filled_shares"] = max(old, float(filled_shares))
+                order["status"] = status
+                if status.upper() in ("CANCELED", "CANCELLED", "EXPIRED"):
+                    remaining = max(0.0, float(order.get("shares") or 0) - float(order["filled_shares"]))
+                    row["exit_listed_shares"] = max(0.0, float(row.get("exit_listed_shares") or 0) - remaining)
+                    order["shares"] = float(order["filled_shares"])
+                if row["shares"] <= 1e-9 and not self.live_rest_orders(match_id=match_id, token_id=token_id):
+                    row["status"] = "closed"
+                    row["close_reason"] = "exit_sell_filled"
+                self._save()
+                return delta
+        return 0.0
+
+    def close_empty_rest_lot(self, token_id: str, match_id: str, *, reason: str) -> bool:
+        """Close a lot that has no inventory and no live rest bids."""
+        mid, tid = str(match_id), str(token_id)
+        for row in self._rows:
+            if (
+                row.get("status") == "open"
+                and str(row.get("match_id")) == mid
+                and str(row.get("token_id")) == tid
+            ):
+                if float(row.get("shares") or 0) > 1e-9:
+                    return False
+                if any(
+                    rest_order_is_live(o)
+                    for o in (row.get("rest_orders") or [])
+                    if isinstance(o, dict)
+                ):
+                    return False
+                row["status"] = "closed"
+                row["close_reason"] = reason
+                self._save()
+                return True
+        return False
+
+
     def purge_dry_run_opens(self, *, reason: str = "pre_live_purge") -> int:
         """Close simulated (live=False) open lots before enabling live trading."""
         return self.purge_dry_run_opens_for_signals(
@@ -464,3 +765,19 @@ class OpenPositionLedger:
 
     def all_open(self) -> list[dict[str, Any]]:
         return [r for r in self._rows if r.get("status") == "open"]
+
+
+def rest_order_is_live(order: dict[str, Any]) -> bool:
+    status = str(order.get("status") or "").upper()
+    if status in ("CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXPIRED"):
+        return False
+    return rest_order_working_usdc(order) > 1e-9
+
+
+def rest_order_working_usdc(order: dict[str, Any]) -> float:
+    try:
+        usdc = float(order.get("usdc") or 0)
+        filled = float(order.get("filled_usdc") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, usdc - filled)

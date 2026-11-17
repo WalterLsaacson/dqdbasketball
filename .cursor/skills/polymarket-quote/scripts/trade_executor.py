@@ -4,15 +4,39 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
-from decimal import ROUND_DOWN, Decimal
+import time
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from pathlib import Path
 from typing import Any
 
 import quote_lib as lib
 from clob_trader import ClobTrader
+from exit_sell import (
+    EXIT_MIN_ENTRY,
+    EXIT_MIN_SHARES,
+    EXIT_SELL_PRICE,
+    EXIT_SELL_TICK,
+    ensure_exit_eligible,
+    exit_unlisted_shares,
+    is_dongqiudi_match_id,
+    untracked_fill,
+)
 from fill_planner import FillPlan, plan_fill
+from rest_ladder import (
+    FAK_ZONE_MAX_ASK,
+    MIN_REST_USDC,
+    allocate_rest_ladder,
+    ask_in_fak_zone,
+    rest_enabled,
+    rest_expire_s,
+    rest_limit_tick_size,
+    rest_min_shares,
+    rest_place_usdc_for_wallet,
+    rest_target_usdc,
+)
 from size_policy import compute_buy_size_caps
 from score_reversal import (
     AF_STATUS_CONFIRMED,
@@ -25,20 +49,25 @@ from score_reversal import (
     entry_tuple,
     event_signals_reversal,
     ft_reversal_vs_entry,
+    iso_now,
     lot_depends_on_disallowed_goal,
+    parse_iso,
+    rest_order_working_usdc,
     score_pair,
 )
 from trade_settings import TradeSettings
 
 logger = logging.getLogger("pm_quote.trade")
 
+REST_ORDER_RECHECK_INTERVAL_S = 2.0
+CUSHION_REST_USDC = 1.0
+CUSHION_REST_PRICES = (0.99,)
+
 # CLOB FAK/FOK sell: maker (shares) max 2 decimals; floor to avoid invalid maker amount.
 FLATTEN_SHARE_DECIMALS = 2
 FLATTEN_MIN_SHARES = Decimal("0.01")
-# Emergency flatten floor price (do not dump into sub-0.2 bids forever).
-FLATTEN_MIN_PRICE = Decimal("0.5")
-# If 0.2 FAK leaves the full bag, one dump attempt at the tick floor.
-FLATTEN_DUMP_MIN_PRICE = Decimal("0.01")
+# Emergency flatten never sells below the configured fraction of entry cost.
+FLATTEN_FLOOR_PCT_DEFAULT = Decimal("0.80")
 # Polymarket matched-order cache often rejects 100% sells; keep a haircut.
 FLATTEN_SELL_HAIRCUT = Decimal("0.99")
 # Live bal vs gate bal: within this → trust gate "free"; else size from live only.
@@ -74,6 +103,24 @@ def floor_shares(shares: Decimal | float | str, *, decimals: int = FLATTEN_SHARE
     if d <= 0:
         return Decimal("0")
     return (d / q).to_integral_value(rounding=ROUND_DOWN) * q
+
+
+def flatten_floor_price(lot: dict[str, Any], tick_size: str | float | None) -> Decimal:
+    """Minimum permitted exit price, rounded up to a legal book tick."""
+    try:
+        pct = Decimal(os.getenv("QUOTE_FLATTEN_FLOOR_PCT", "0.80"))
+        shares = Decimal(str(lot.get("shares") or 0))
+        usdc = Decimal(str(lot.get("usdc") or 0))
+        tick = Decimal(str(tick_size or "0.01"))
+    except Exception:  # noqa: BLE001
+        pct, shares, usdc, tick = FLATTEN_FLOOR_PCT_DEFAULT, Decimal(0), Decimal(0), Decimal("0.01")
+    pct = min(Decimal(1), max(Decimal(0), pct))
+    if tick <= 0:
+        tick = Decimal("0.01")
+    entry = usdc / shares if shares > 0 else Decimal("0.5")
+    raw = max(Decimal("0.01"), entry * pct)
+    price = (raw / tick).to_integral_value(rounding=ROUND_UP) * tick
+    return min(price, Decimal("1") - tick)
 
 
 def flatten_sell_shares(bal: Decimal) -> Decimal:
@@ -211,6 +258,60 @@ def signal_from_event_key(event_key: str) -> str:
     return ek.split("|", 1)[0]
 
 
+
+def quote_reversal_cushion(quote: dict[str, Any] | None) -> bool:
+    raw = (quote or {}).get("reversal_cushion")
+    if raw is True:
+        return True
+    if raw is False or raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes"}
+
+
+def flatten_order_id(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    direct = str(response.get("orderID") or response.get("order_id") or response.get("id") or "")
+    if direct:
+        return direct
+    for key in ("order", "result", "data"):
+        nested = response.get(key)
+        if isinstance(nested, dict):
+            found = flatten_order_id(nested)
+            if found:
+                return found
+    return ""
+
+
+def _rest_remote_filled_shares(remote: dict[str, Any], order: dict[str, Any]) -> float:
+    for key in ("size_matched", "sizeMatched", "matched_shares", "takingAmount"):
+        raw = remote.get(key)
+        try:
+            if raw is not None and str(raw) != "":
+                val = float(raw)
+                if val >= 0:
+                    return val
+        except (TypeError, ValueError):
+            continue
+    return float(order.get("filled_shares") or 0)
+
+
+def _rest_remote_filled_usdc(remote: dict[str, Any], order: dict[str, Any], filled_shares: float) -> float:
+    for key in ("makingAmount", "matched_usdc", "size_matched_usdc"):
+        raw = remote.get(key)
+        try:
+            if raw is not None and str(raw) != "":
+                val = float(raw)
+                if val >= 0:
+                    return val
+        except (TypeError, ValueError):
+            continue
+    px = float(order.get("price") or 0)
+    if filled_shares > 0 and px > 0:
+        return round(filled_shares * px, 6)
+    return float(order.get("filled_usdc") or 0)
+
+
 class TradeExecutor:
     """Plan → optional post → trades.jsonl; memory + file idempotency."""
 
@@ -235,6 +336,11 @@ class TradeExecutor:
         self._flatten_done: set[str] = set()
         # Matches with in-flight / pending exits — block new buy_win opens.
         self._buy_blocked_matches: set[str] = set()
+        self._rest_blocked_matches: set[str] = set()
+        self._rest_epoch: dict[str, int] = {}
+        self._rest_canceling: set[tuple[str, str]] = set()
+        self._exit_wait_logged: set[str] = set()
+        self._exit_seeded = False
         self._lock = threading.RLock()
         self.ledger = OpenPositionLedger(lib.data_dir(self.root) / "open_positions.json")
         self._load_recent_successes()
@@ -343,6 +449,8 @@ class TradeExecutor:
         for (mid, tid), row in latest.items():
             if (mid, tid) in flattened:
                 continue
+            if self.ledger.invalidated_market(tid, mid):
+                continue
             if any(
                 str(x.get("token_id")) == tid
                 for x in self.ledger.open_for_match(mid)
@@ -356,6 +464,8 @@ class TradeExecutor:
                 match_id=mid,
                 token_id=tid,
                 market_key=str(row.get("market_key") or ""),
+                market_id=str(row.get("market_id") or ""),
+                condition_id=str(row.get("condition_id") or ""),
                 shares=shares,
                 usdc=float(plan.get("usdc") or 0),
                 home_score=row.get("home_score"),
@@ -397,21 +507,20 @@ class TradeExecutor:
 
         # Peek finished scores from events.jsonl (matches drop off matches.json).
         try:
-            for line in (lib.bridge_dir(self.root) / "events.jsonl").read_text(
-                encoding="utf-8"
-            ).splitlines()[-50000:]:
-                if not line.strip():
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                if (ev.get("type") or "") != "match_finished":
-                    continue
-                mid = str(ev.get("match_id") or "")
-                sc = score_pair(ev.get("home_score"), ev.get("away_score"))
-                if mid and sc:
-                    latest_ft[mid] = sc
+            with (lib.bridge_dir(self.root) / "events.jsonl").open(encoding="utf-8") as events:
+                for line in events:
+                    if '"match_finished"' not in line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") != "match_finished":
+                        continue
+                    mid = str(ev.get("match_id") or "")
+                    sc = score_pair(ev.get("home_score"), ev.get("away_score"))
+                    if mid and sc:
+                        latest_ft[mid] = sc
         except OSError:
             pass
 
@@ -572,6 +681,30 @@ class TradeExecutor:
                 "skip_reason": "already_done",
             }
 
+        # The FT event can carry a Playing boxscore. Only the quote built from
+        # a fresh, final-status DQD fetch may authorize an FT player-prop buy.
+        if (
+            channel_live
+            and typ == "match_finished"
+            and trade == "buy_win"
+            and quote.get("family") == "player_prop"
+            and quote.get("ft_boxscore_final_fresh") is not True
+        ):
+            row = self._record(
+                quote,
+                event_key=event_key,
+                match_meta=match_meta,
+                plan=None,
+                status="skipped",
+                skip_reason="ft_player_prop_requires_fresh_final_boxscore",
+                response=None,
+                success=False,
+                idempotency_key=key,
+                live=True,
+            )
+            self._done.add(key)
+            return row
+
         # Price guard on the reference book price (best ask/bid)
         ref_price = quote.get("best_ask") if trade == "buy_win" else quote.get("best_bid")
         try:
@@ -579,6 +712,15 @@ class TradeExecutor:
         except (TypeError, ValueError):
             ref_f = None
         extreme = self._extreme_price_blocked(ref_f)
+        # A locally settled WIN at the FAK ceiling is the basketball entry
+        # strategy, even though the generic extreme-price guard starts at 0.99.
+        if (
+            trade == "buy_win"
+            and str(quote.get("settlement") or "") == "WIN"
+            and ref_f is not None
+            and 0.99 - 1e-12 <= ref_f <= FAK_ZONE_MAX_ASK + 1e-12
+        ):
+            extreme = None
         if extreme:
             row = self._record(
                 quote,
@@ -664,28 +806,56 @@ class TradeExecutor:
         max_shares = float(self.settings.max_shares)
         size_meta: dict[str, Any] | None = None
         if trade == "buy_win":
-            open_usdc = sum(
-                float(r.get("usdc") or 0)
-                for r in self.ledger.all_open()
+            mid = str((match_meta or {}).get("match_id") or quote.get("match_id") or "")
+            market_key = str(quote.get("market_key") or "")
+            market_id = str(quote.get("market_id") or "")
+            condition_id = str(quote.get("condition_id") or "")
+            if channel_live and (not mid or not (condition_id or market_id or market_key)):
+                return self._record(
+                    quote,
+                    event_key=event_key,
+                    match_meta=match_meta,
+                    plan=None,
+                    status="skipped",
+                    skip_reason="market_budget_missing_identity",
+                    response=None,
+                    success=False,
+                    idempotency_key=key,
+                    live=True,
+                )
+            market_usdc = self.ledger.market_buy_commitment_usdc(
+                match_id=mid,
+                market_key=market_key,
+                token_id=token_id,
+                market_id=market_id,
+                condition_id=condition_id,
             )
             caps = compute_buy_size_caps(
                 ref_f,
                 max_usdc=self.settings.max_usdc,
                 max_shares=self.settings.max_shares,
                 tiers=self.settings.size_tiers,
-                open_usdc=open_usdc,
-                max_open_usdc=self.settings.max_open_usdc,
+                open_usdc=market_usdc,
+                max_open_usdc=self.settings.max_market_usdc,
                 floor_usdc=self.settings.size_floor_usdc,
             )
             size_meta = caps.to_dict()
+            size_meta["scope"] = "match_market"
+            size_meta["market_key"] = market_key
             if caps.skip_reason:
+                reason = (
+                    "size_policy_market_budget"
+                    if caps.skip_reason == "size_policy_open_budget"
+                    else caps.skip_reason
+                )
+                size_meta["skip_reason"] = reason
                 row = self._record(
                     quote,
                     event_key=event_key,
                     match_meta=match_meta,
                     plan=None,
                     status="skipped",
-                    skip_reason=caps.skip_reason,
+                    skip_reason=reason,
                     response=None,
                     success=False,
                     idempotency_key=key,
@@ -696,8 +866,8 @@ class TradeExecutor:
             max_usdc = float(caps.max_usdc)
             max_shares = float(caps.max_shares)
             logger.info(
-                "size_policy ask=%.3f tier=%.2f eff_usdc=%.2f eff_shares=%.2f "
-                "open=%.2f remaining=%s",
+                "market_size_policy ask=%.3f tier=%.2f eff_usdc=%.2f eff_shares=%.2f "
+                "market_committed=%.2f remaining=%s",
                 caps.ask,
                 caps.tier_usdc,
                 caps.max_usdc,
@@ -706,13 +876,17 @@ class TradeExecutor:
                 caps.remaining_open,
             )
 
+        max_slippage = self.settings.max_slippage
+        if trade == "buy_win" and ref_f is not None and ref_f <= FAK_ZONE_MAX_ASK:
+            # Walk depth must not take a higher ask than the WIN FAK ceiling.
+            max_slippage = min(max_slippage, max(0.0, FAK_ZONE_MAX_ASK - ref_f))
         plan = plan_fill(
             quote,
             take_depth=self.settings.take_depth,
             max_levels=self.settings.max_levels,
             max_usdc=max_usdc,
             max_shares=max_shares,
-            max_slippage=self.settings.max_slippage,
+            max_slippage=max_slippage,
             min_order_shares=self.settings.min_order_shares,
             available_shares=available,
         )
@@ -732,6 +906,24 @@ class TradeExecutor:
                 extra={"size_policy": size_meta} if size_meta else None,
             )
             return row
+
+        if (
+            trade == "buy_win"
+            and market_usdc + float(plan.usdc) > float(self.settings.max_market_usdc) + 1e-9
+        ):
+            return self._record(
+                quote,
+                event_key=event_key,
+                match_meta=match_meta,
+                plan=plan,
+                status="skipped",
+                skip_reason="size_policy_market_budget",
+                response=None,
+                success=False,
+                idempotency_key=key,
+                live=channel_live,
+                extra={"size_policy": size_meta} if size_meta else None,
+            )
 
         if not channel_live:
             row = self._record(
@@ -905,6 +1097,8 @@ class TradeExecutor:
             match_id=mid,
             token_id=str(quote.get("token_id") or ""),
             market_key=str(quote.get("market_key") or ""),
+            market_id=str(quote.get("market_id") or ""),
+            condition_id=str(quote.get("condition_id") or ""),
             shares=float(plan.shares),
             usdc=float(plan.usdc),
             home_score=meta.get("home_score"),
@@ -1254,7 +1448,7 @@ class TradeExecutor:
             )
             return row
 
-        # Live FAK sell: cancel locks, haircut size, min_price=0.2 (dump fallback).
+        # Live FAK sell: cancel locks, haircut size, respect entry-price floor.
         try:
             trader = self.ensure_trader()
             if trader is None:
@@ -1395,7 +1589,7 @@ class TradeExecutor:
             tick = str(lot.get("tick_size") or "0.01") or "0.01"
             neg = lot.get("neg_risk")
             neg_risk = bool(neg) if neg is not None else None
-            min_px = FLATTEN_MIN_PRICE
+            min_px = flatten_floor_price(lot, tick)
             response, shares, ok = self._flatten_post_sell(
                 trader,
                 token_id=token_id,
@@ -1410,41 +1604,6 @@ class TradeExecutor:
                 residual = Decimal(str(trader.get_conditional_balance(token_id)))
             except Exception:  # noqa: BLE001
                 residual = Decimal("-1")
-
-            # No fill at 0.2 (thin book): one dump attempt at 0.01.
-            if (
-                residual >= FLATTEN_MIN_SHARES
-                and bal > 0
-                and residual >= bal - Decimal("0.02")
-            ):
-                try:
-                    trader.cancel_orders_for_asset(token_id)
-                except Exception:  # noqa: BLE001
-                    pass
-                dump_shares = flatten_sell_shares(residual)
-                if dump_shares >= FLATTEN_MIN_SHARES:
-                    logger.warning(
-                        "flatten dump retry match=%s token=%s… shares=%s min=%s",
-                        mid,
-                        token_id[:12],
-                        dump_shares,
-                        FLATTEN_DUMP_MIN_PRICE,
-                    )
-                    response, shares, ok = self._flatten_post_sell(
-                        trader,
-                        token_id=token_id,
-                        shares=dump_shares,
-                        tick=tick,
-                        min_price=FLATTEN_DUMP_MIN_PRICE,
-                        neg_risk=neg_risk,
-                    )
-                    min_px = FLATTEN_DUMP_MIN_PRICE
-                    try:
-                        residual = Decimal(
-                            str(trader.get_conditional_balance(token_id))
-                        )
-                    except Exception:  # noqa: BLE001
-                        residual = Decimal("-1")
 
             residual_floor = (
                 floor_shares(residual) if residual >= 0 else Decimal("-1")
@@ -1677,7 +1836,7 @@ class TradeExecutor:
                 token_id=token_id,
                 shares=shares,
                 tick=tick,
-                min_price=FLATTEN_DUMP_MIN_PRICE,
+                min_price=flatten_floor_price(lot, tick),
                 neg_risk=neg_risk,
             )
         except Exception as e2:  # noqa: BLE001
@@ -1712,7 +1871,7 @@ class TradeExecutor:
             order_type="FAK",
             shares=float(shares),
             usdc=0.0,
-            worst_price=float(FLATTEN_DUMP_MIN_PRICE),
+            worst_price=float(flatten_floor_price(lot, tick)),
             levels_used=0,
             levels=[],
             skip_reason=None,
@@ -1747,6 +1906,279 @@ class TradeExecutor:
                 reason=flatten_reason_append(reason, "balance_gate_partial"),
             )
         return row
+
+    def offer_rest_buy(
+        self, quote: dict[str, Any], *, event_key: str,
+        match_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Post one 0.99 bid for a locally settled WIN token with no FAK ask."""
+        with self._lock:
+            if not self.settings.enabled:
+                return None
+            typ = self._resolve_event_type(event_key=event_key, match_meta=match_meta)
+            if (
+                self._live_for_signal(typ)
+                and typ == "match_finished"
+                and quote.get("family") == "player_prop"
+                and quote.get("ft_boxscore_final_fresh") is not True
+            ):
+                return None
+            if not rest_enabled():
+                return None
+            if quote.get("book_missing"):
+                return None
+            bid = quote.get("best_bid")
+            try:
+                if bid is None or float(bid) < float(self.settings.min_buy_price):
+                    return None
+            except (TypeError, ValueError):
+                return None
+            if str(quote.get("settlement") or "") != "WIN":
+                return None
+            meta = match_meta or {}
+            mid = str(meta.get("match_id") or quote.get("match_id") or "")
+            tid = str(quote.get("token_id") or "")
+            if not mid or not tid or mid in self._buy_blocked_matches or mid in self._rest_blocked_matches:
+                return None
+            ask = quote.get("best_ask")
+            if ask is not None:
+                try:
+                    if ask_in_fak_zone(ask):
+                        return None
+                except (TypeError, ValueError):
+                    return None
+            if self.ledger.live_rest_orders(match_id=mid, token_id=tid):
+                return None
+            market_key = str(quote.get("market_key") or "")
+            market_id = str(quote.get("market_id") or "")
+            condition_id = str(quote.get("condition_id") or "")
+            if not (condition_id or market_id or market_key):
+                return None
+            key = trade_idempotency_key(event_key, tid, "rest_buy")
+            if key in self._done:
+                return None
+            committed = self.ledger.market_buy_commitment_usdc(
+                match_id=mid, market_key=market_key, token_id=tid,
+                market_id=market_id, condition_id=condition_id,
+            )
+            remaining = max(0.0, float(self.settings.max_market_usdc) - committed)
+            budget = min(rest_target_usdc(), float(self.settings.max_usdc), remaining)
+            if budget <= 0:
+                return None
+            levels = allocate_rest_ladder(
+                budget, tick_size=quote.get("tick_size") or "0.001",
+                best_bid=quote.get("best_bid"), best_ask=ask,
+                min_shares=rest_min_shares(quote),
+            )
+            if not levels:
+                return None
+            level = levels[0]
+            shares = min(float(level["shares"]), float(self.settings.max_shares))
+            shares = float(floor_shares(shares))
+            if shares + 1e-9 < rest_min_shares(quote):
+                return None
+            px = float(level["price"])
+            plan = FillPlan(
+                trade="rest_buy", side="BUY", take_depth="rest", order_type="GTC",
+                shares=shares, usdc=round(shares * px, 6), worst_price=px,
+                levels_used=1, levels=[{"price": px, "shares": shares}], skip_reason=None,
+            )
+            # The ladder may round shares upward to satisfy a minimum notional.
+            # Never let that rounding exceed this market's $1 commitment cap.
+            if plan.usdc > budget + 1e-9:
+                return None
+            stub = {**quote, "trade": "rest_buy"}
+            live = self._live_for_signal(str(meta.get("event_type") or signal_from_event_key(event_key)))
+            if not live:
+                self._done.add(key)
+                return self._record(stub, event_key=event_key, match_meta=meta, plan=plan,
+                    status="dry_run", skip_reason=None, response=None, success=True,
+                    idempotency_key=key, live=False)
+            try:
+                trader = self.ensure_trader()
+                assert trader is not None
+                available = float(trader.get_collateral_usdc())
+                spend = rest_place_usdc_for_wallet(plan.usdc, available=available)
+                if spend + 1e-9 < plan.usdc:
+                    return None
+                exp_s = rest_expire_s()
+                response = trader.post_limit_buy(
+                    tid, Decimal(str(shares)), Decimal(str(px)),
+                    rest_limit_tick_size(quote.get("tick_size")),
+                    order_type="GTD" if exp_s > 0 else "GTC",
+                    expiration=int(time.time() + exp_s) if exp_s > 0 else 0,
+                    neg_risk=quote.get("neg_risk"),
+                )
+                oid = str(response.get("orderID") or response.get("id") or "")
+                ok = trader.is_order_success(response, market=False)
+                if ok and oid:
+                    self.ledger.add_rest_order(
+                        match_id=mid, token_id=tid,
+                        order={"order_id": oid, "price": px, "shares": shares,
+                               "usdc": plan.usdc, "filled_shares": 0.0,
+                               "filled_usdc": 0.0, "status": "LIVE"},
+                        market_key=str(quote.get("market_key") or ""),
+                        market_id=market_id,
+                        condition_id=condition_id,
+                        family=str(quote.get("family") or ""), event_key=event_key,
+                        home=str(meta.get("home") or ""), away=str(meta.get("away") or ""),
+                        home_score=meta.get("home_score"), away_score=meta.get("away_score"),
+                        live=True, tick_size=str(quote.get("tick_size") or "0.001"),
+                        neg_risk=quote.get("neg_risk"),
+                    )
+                    self._done.add(key)
+                elif ok:
+                    # An accepted order without an ID may be working remotely.
+                    # Persist an untracked reservation so restart cannot post it twice.
+                    self.ledger.add_rest_order(
+                        match_id=mid, token_id=tid,
+                        order={"order_id": f"untracked:{key}", "price": px,
+                               "shares": shares, "usdc": plan.usdc,
+                               "filled_shares": 0.0, "filled_usdc": 0.0,
+                               "status": "UNKNOWN"},
+                        market_key=str(quote.get("market_key") or ""),
+                        market_id=market_id,
+                        condition_id=condition_id,
+                        family=str(quote.get("family") or ""), event_key=event_key,
+                        home=str(meta.get("home") or ""), away=str(meta.get("away") or ""),
+                        home_score=meta.get("home_score"), away_score=meta.get("away_score"),
+                        live=True, tick_size=str(quote.get("tick_size") or "0.001"),
+                        neg_risk=quote.get("neg_risk"),
+                    )
+                    self._done.add(key)
+                return self._record(stub, event_key=event_key, match_meta=meta, plan=plan,
+                    status="posted" if ok else "error",
+                    skip_reason=None if oid else "missing_order_id",
+                    response=response, success=ok and bool(oid), idempotency_key=key, live=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("rest buy failed: %s", exc)
+                return self._record(stub, event_key=event_key, match_meta=meta, plan=plan,
+                    status="error", skip_reason=str(exc), response=None, success=False,
+                    idempotency_key=key, live=True)
+
+    def reconcile_rest_orders(self) -> int:
+        """Import matched rest shares before deciding whether to list exits."""
+        with self._lock:
+            pairs = self.ledger.live_rest_orders()
+            if not pairs or not self.settings.live:
+                return 0
+            trader = self.ensure_trader()
+            assert trader is not None
+            fills = 0
+            for lot, order in pairs:
+                oid = str(order.get("order_id") or "")
+                remote = trader.get_order(oid)
+                if not remote:
+                    continue
+                status = str(remote.get("status") or order.get("status") or "LIVE").upper()
+                filled = _rest_remote_filled_shares(remote, order)
+                cost = _rest_remote_filled_usdc(remote, order, filled)
+                delta = self.ledger.apply_rest_fill(
+                    match_id=str(lot.get("match_id") or ""),
+                    token_id=str(lot.get("token_id") or ""), order_id=oid,
+                    filled_shares=filled, filled_usdc=cost, status=status,
+                )
+                if delta > 0:
+                    fills += 1
+            return fills
+
+    def cancel_rest_orders(self, match_id: str) -> int:
+        """Stop bids for a finished or reversed match and persist the result."""
+        with self._lock:
+            mid = str(match_id or "")
+            if not mid:
+                return 0
+            self._rest_blocked_matches.add(mid)
+            pairs = self.ledger.live_rest_orders(match_id=mid)
+            if not pairs:
+                return 0
+            if not self.settings.live:
+                return 0
+            self.reconcile_rest_orders()
+            pairs = self.ledger.live_rest_orders(match_id=mid)
+            trader = self.ensure_trader()
+            assert trader is not None
+            canceled = 0
+            for lot, order in pairs:
+                oid = str(order.get("order_id") or "")
+                if not oid or oid.startswith("untracked:"):
+                    continue
+                trader.cancel_order(oid)
+                remote = trader.get_order(oid)
+                if not remote:
+                    # A cancel response alone has no final cumulative fill.
+                    # Leave the order live so regular reconciliation can retry.
+                    logger.warning("rest cancel lacks final order snapshot order=%s", oid)
+                    continue
+                remote_status = str(remote.get("status") or "").upper()
+                filled = _rest_remote_filled_shares(remote, order)
+                self.ledger.apply_rest_fill(
+                    match_id=mid, token_id=str(lot.get("token_id") or ""),
+                    order_id=oid,
+                    filled_shares=filled,
+                    filled_usdc=_rest_remote_filled_usdc(remote, order, filled),
+                    status=remote_status or "LIVE",
+                )
+                if remote_status in ("CANCELED", "CANCELLED", "EXPIRED"):
+                    canceled += 1
+            return canceled
+
+    def offer_exit_sells(self) -> int:
+        """List only confirmed, unlisted inventory at 0.999."""
+        with self._lock:
+            if os.getenv("QUOTE_EXIT_SELL_ENABLED", "1").strip().lower() in ("0", "false", "off", "no"):
+                return 0
+            if not self.settings.live:
+                return 0
+            trader = self.ensure_trader()
+            assert trader is not None
+            posted = 0
+            for lot in list(self.ledger.all_open()):
+                if not lot.get("live"):
+                    continue
+                mid = str(lot.get("match_id") or "")
+                tid = str(lot.get("token_id") or "")
+                if not mid or not tid or lot.get("pending_flatten"):
+                    continue
+                try:
+                    if float(lot.get("tick_size") or "0.01") > 0.001 + 1e-12:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                for order in list(lot.get("exit_orders") or []):
+                    if str(order.get("status") or "").upper() in ("FILLED", "MATCHED", "CANCELED", "CANCELLED", "EXPIRED"):
+                        continue
+                    oid = str(order.get("order_id") or "")
+                    remote = trader.get_order(oid) if oid else None
+                    if remote:
+                        self.ledger.apply_exit_fill(match_id=mid, token_id=tid,
+                            order_id=oid, filled_shares=_rest_remote_filled_shares(remote, order),
+                            status=str(remote.get("status") or "LIVE").upper())
+                if lot.get("status") != "open":
+                    continue
+                ensure_exit_eligible(lot)
+                gap = exit_unlisted_shares(lot, min_shares=EXIT_MIN_SHARES)
+                if gap <= 0:
+                    continue
+                balance = float(trader.get_conditional_balance(tid))
+                listed = float(lot.get("exit_listed_shares") or 0)
+                shares = float(floor_shares(min(gap, max(0.0, balance - listed))))
+                if shares + 1e-9 < EXIT_MIN_SHARES:
+                    continue
+                response = trader.post_limit_sell(tid, Decimal(str(shares)),
+                    Decimal(str(EXIT_SELL_PRICE)), EXIT_SELL_TICK,
+                    neg_risk=lot.get("neg_risk"))
+                oid = str(response.get("orderID") or response.get("id") or "")
+                if not trader.is_order_success(response, market=False):
+                    logger.warning("exit sell rejected token=%s response=%s", tid[:12], response)
+                    continue
+                if not oid:
+                    oid = f"untracked:{mid}:{tid}:{int(time.time())}"
+                    logger.error("exit sell accepted without order ID token=%s; manual reconciliation required", tid[:12])
+                self.ledger.add_exit_order(match_id=mid, token_id=tid,
+                    order_id=oid, shares=shares, price=EXIT_SELL_PRICE)
+                posted += 1
+            return posted
 
     def _position_shares(self, token_id: str) -> float | None:
         """Available conditional balance.
@@ -1796,6 +2228,8 @@ class TradeExecutor:
             or signal_from_event_key(event_key)
             or "",
             "market_key": quote.get("market_key"),
+            "market_id": quote.get("market_id"),
+            "condition_id": quote.get("condition_id"),
             "family": quote.get("family"),
             "outcome": quote.get("outcome"),
             "settlement": quote.get("settlement"),

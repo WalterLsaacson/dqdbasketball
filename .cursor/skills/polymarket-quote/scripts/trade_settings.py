@@ -66,7 +66,7 @@ class TradeSettings:
     enabled: bool
     # Price-tiered buy sizing (from .env); hard caps remain max_usdc/max_shares.
     size_tiers: tuple[tuple[float, float], ...]
-    max_open_usdc: float
+    max_market_usdc: float
     size_floor_usdc: float
 
     @property
@@ -142,7 +142,9 @@ def load_trade_settings(
         hard_shares = 25.0
 
     tiers = parse_size_tiers(os.getenv("QUOTE_SIZE_TIERS"))
-    max_open = float(os.getenv("QUOTE_MAX_OPEN_USDC", "1000") or 1000)
+    max_market = float(os.getenv("QUOTE_MAX_MARKET_USDC", str(hard_usdc)) or hard_usdc)
+    if max_market <= 0:
+        raise ValueError("QUOTE_MAX_MARKET_USDC must be positive")
     floor_usdc = float(os.getenv("QUOTE_SIZE_FLOOR_USDC", "1") or 1)
 
     funder = os.getenv("FUNDER", "").strip() or None
@@ -167,7 +169,7 @@ def load_trade_settings(
         min_order_shares=float(os.getenv("MIN_ORDER_SHARES", "0")),
         enabled=bool(enabled),
         size_tiers=tuple(tiers) if tiers else tuple(DEFAULT_SIZE_TIERS),
-        max_open_usdc=max(0.0, max_open),
+        max_market_usdc=max_market,
         size_floor_usdc=max(0.0, floor_usdc),
     )
 

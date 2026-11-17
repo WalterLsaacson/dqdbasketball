@@ -37,8 +37,9 @@ WIN_RE = re.compile(r"will\s+(.+?)\s+win\s+on\b", re.I)
 DRAW_RE = re.compile(r"end\s+in\s+a\s+draw", re.I)
 SPREAD_RE = re.compile(r"spread:\s*(.+?)\s*\(([+-]?\d+(?:\.\d+)?)\)", re.I)
 TOTAL_RE = re.compile(r"o/?u\s*(\d+(?:\.\d+)?)", re.I)
-HALF_1_RE = re.compile(r"(?:1st|first)\s*half", re.I)
-HALF_2_RE = re.compile(r"(?:2nd|second)\s*half", re.I)
+HALF_1_RE = re.compile(r"(?:1st|first)\s*half|\b1h\b", re.I)
+HALF_2_RE = re.compile(r"(?:2nd|second)\s*half|\b2h\b", re.I)
+TEAM_TOTAL_RE = re.compile(r"\bteam\s+total\b", re.I)
 EXACT_WIN_RE = re.compile(r"will\s+(.+?)\s+win\s+(\d+)\s*[-–]\s*(\d+)\s*\?", re.I)
 EXACT_DRAW_RE = re.compile(r"draw\s+(\d+)\s*[-–]\s*(\d+)", re.I)
 SCORE_PAIR_RE = re.compile(r"\b(\d+)\s*[-–]\s*(\d+)\b")
@@ -46,8 +47,8 @@ SCORE_PAIR_RE = re.compile(r"\b(\d+)\s*[-–]\s*(\d+)\b")
 DEFAULT_EPS = 0.005
 # Polymarket sports taker feeRate (2026): fee/share = feeRate * p * (1-p)
 SPORTS_TAKER_FEE_RATE = 0.05
-# Min net edge per share after fee before writing opportunities.jsonl
-DEFAULT_MIN_NET = 0.02
+# The 0.995 FAK ceiling leaves about 0.00475 USDC/share after the sports fee.
+DEFAULT_MIN_NET = 0.0045
 TOP_N = 5
 
 
@@ -338,6 +339,9 @@ def settle_yes_no(yes_wins: bool) -> tuple[str, str]:
     return "LOSE", "WIN"
 
 
+_MONEYLINE_SUCCESS_TYPES = ("moneyline", "child_moneyline", "")
+
+
 def moneyline_tokens(
     markets: list[dict[str, Any]],
     *,
@@ -351,6 +355,11 @@ def moneyline_tokens(
     Supports:
     - Two-way team-name markets: outcomes=["Home Team", "Away Team"]
     - Legacy Yes/No per-team markets ("Will X win…")
+
+    Only full-game winner markets belong here. Sibling types such as
+    "basketball_team_to_score_first", "first_half_moneyline" and
+    "basketball_game_race_to_points" are different bets: settling them from the
+    full-game winner produced phantom WIN legs, so they are skipped.
     """
     winner = winner_from_score(home_score, away_score)
     rows: list[dict[str, Any]] = []
@@ -369,9 +378,13 @@ def moneyline_tokens(
     for m in markets:
         smt = (m.get("sports_market_type") or "").lower()
         q = m.get("question") or ""
-        if smt and smt not in ("moneyline", "child_moneyline", ""):
-            if " vs" not in q.lower() and not WIN_RE.search(q):
-                continue
+        if smt not in _MONEYLINE_SUCCESS_TYPES:
+            continue
+        # The question must actually be about winning the game.
+        if not (WIN_RE.search(q) or "moneyline" in q.lower() or " vs" in q.lower()):
+            continue
+        if "score first" in q.lower() or "race to" in q.lower():
+            continue
         outcomes = list(m.get("outcomes") or [])
         tokens = list(m.get("clob_token_ids") or [])
         if len(tokens) < 2:
@@ -454,9 +467,13 @@ def _outcome_is_over(label: str) -> bool | None:
     return None
 
 
+# Question-text markers per stat. These match the wording of the market
+# question only, never the raw sports_market_type, because Gamma's threes
+# type is "threes" while its question says "3-Pointers Made" — and "point"
+# is a substring of "3-Pointers", which used to settle threes as points.
 _PLAYER_STAT_ALIASES = {
-    "score": ("score", "points", "point", "pts"),
-    "points": ("points", "point", "pts", "score"),
+    "score": ("points", "point", "pts"),
+    "points": ("points", "point", "pts"),
     "assists": ("assists", "assist", "ast"),
     "assist": ("assists", "assist", "ast"),
     "rebounds": ("rebounds", "rebound", "reb"),
@@ -465,9 +482,112 @@ _PLAYER_STAT_ALIASES = {
     "steal": ("steals", "steal", "stl"),
     "blocks": ("blocks", "block", "blk"),
     "block": ("blocks", "block", "blk"),
-    "threes": ("threes", "three", "3pt", "3-pointers", "three_point"),
-    "three_point": ("threes", "three", "3pt", "3-pointers", "three_point"),
+    "threes": ("3-pointers", "3pt", "three", "threes"),
+    "three_point": ("3-pointers", "3pt", "three", "threes"),
+    "three_pointers": ("3-pointers", "3pt", "three", "threes"),
 }
+
+# Gamma sports_market_type values that are unambiguous on their own.
+# Keys are already normalized (_norm_name strips underscores), so
+# "three_pointers" is stored as "threepointers".
+_SMT_STAT_KEYS = {
+    "points": "points",
+    "assists": "assist",
+    "rebounds": "rebound",
+    "steals": "steal",
+    "blocks": "block",
+    "threes": "threes",
+    "threepointers": "threes",
+}
+
+# Normalized alias -> internal stat key.
+_STAT_KEY_ALIASES = {
+    "score": "points",
+    "points": "points",
+    "point": "points",
+    "pts": "points",
+    "assist": "assist",
+    "assists": "assist",
+    "ast": "assist",
+    "rebound": "rebound",
+    "rebounds": "rebound",
+    "reb": "rebound",
+    "steal": "steal",
+    "steals": "steal",
+    "stl": "steal",
+    "block": "block",
+    "blocks": "block",
+    "blk": "block",
+    "threes": "threes",
+    "three": "threes",
+    "threepoint": "threes",
+    "threepointers": "threes",
+    "3pt": "threes",
+    "3pointers": "threes",
+}
+
+
+def _stat_key(stat: Any) -> str:
+    """Normalize a stat name to one internal key: points/assist/rebound/..."""
+    key = _norm_name(str(stat or ""))
+    if not key:
+        return ""
+    return _STAT_KEY_ALIASES.get(key, key)
+
+
+def _stat_number(value: Any) -> float | None:
+    """Read a stat value, including DQD's made-attempted form ("2-5" -> 2)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    head = text.split("-")[0].strip()
+    try:
+        return float(head)
+    except ValueError:
+        return None
+
+
+def _market_player_stat(market: dict[str, Any]) -> tuple[str, str]:
+    """Return (stat_key, normalized player name) for a Gamma basketball prop.
+
+    sports_market_type is authoritative when it names a known stat; the question
+    wording is the fallback. Player comes from the "Name: ..." question prefix.
+    """
+    q = str(market.get("question") or "")
+    smt = _norm_name(str(market.get("sports_market_type") or ""))
+    stat = _SMT_STAT_KEYS.get(smt, "")
+    head = q.split(":", 1)[0] if ":" in q else ""
+    player = _norm_name(head)
+    if not stat:
+        blob = _norm_name(q)
+        # Longest marker first so "3-pointers" wins over "point".
+        for marker in (
+            "3-pointers",
+            "3pt",
+            "threes",
+            "three",
+            "points",
+            "point",
+            "pts",
+            "assists",
+            "assist",
+            "ast",
+            "rebounds",
+            "rebound",
+            "reb",
+            "steals",
+            "steal",
+            "stl",
+            "blocks",
+            "block",
+            "blk",
+        ):
+            if _norm_name(marker) in blob:
+                stat = _stat_key(marker)
+                break
+    return stat, player
 
 
 def player_prop_tokens(
@@ -482,21 +602,32 @@ def player_prop_tokens(
 
     Gamma basketball props commonly use Yes/No (Yes=Over). During live play only
     an already-cleared Over is tradeable; Under waits until FT.
+
+    `stat` may be an internal stat key ("score", "three_point") or a Gamma
+    sports_market_type ("points", "threes"). The market is matched on its
+    sports_market_type first and on the question wording second, so a threes
+    market can never be settled from a points total.
     """
-    try:
-        value = float(curr)
-    except (TypeError, ValueError):
+    value = _stat_number(curr)
+    if value is None:
         return []
-    wanted = _norm_name(stat)
-    aliases = _PLAYER_STAT_ALIASES.get(wanted, (wanted,))
+    wanted = _stat_key(stat)
+    if not wanted:
+        return []
+    aliases = _PLAYER_STAT_ALIASES.get(wanted, ())
     player_key = _norm_name(player)
     rows: list[dict[str, Any]] = []
     for m in markets:
         q = str(m.get("question") or "")
-        blob = _norm_name(f"{m.get('sports_market_type') or ''} {q}")
-        if not any(_norm_name(alias) in blob for alias in aliases):
+        market_key_stat, market_player = _market_player_stat(m)
+        if market_key_stat != wanted:
             continue
-        if player_key and player_key not in blob:
+        question_blob = _norm_name(q)
+        if aliases and not any(_norm_name(a) in question_blob for a in aliases):
+            continue
+        if player_key and market_player and market_player != player_key:
+            continue
+        if player_key and not market_player and player_key not in question_blob:
             continue
         line_match = re.search(r"\b(?:over|under|o/u)\s+(-?\d+(?:\.\d+)?)\b", q, re.I)
         if not line_match:
@@ -506,6 +637,7 @@ def player_prop_tokens(
             line = float(raw_line if raw_line is not None else line_match.group(1))
         except (AttributeError, TypeError, ValueError):
             continue
+        market_id = str(m.get("market_id") or m.get("condition_id") or "")
         over_wins = value > line
         if mode == "live" and not over_wins:
             continue
@@ -522,7 +654,11 @@ def player_prop_tokens(
             rows.append(
                 {
                     "family": "player_prop",
-                    "market_key": f"player_{player_key}_{wanted}_{line}_{'over' if is_over else 'under'}",
+                    "market_key": (
+                        f"player_{player_key}_{wanted}_{line}_"
+                        f"{'over' if is_over else 'under'}"
+                        + (f"_{market_id[-6:]}" if market_id else "")
+                    ),
                     "role": "player_prop",
                     "outcome": label,
                     "settlement": settlement,
@@ -532,9 +668,73 @@ def player_prop_tokens(
                     "question": q,
                     "sports_market_type": m.get("sports_market_type") or "player_prop",
                     "player": player,
-                    "stat": stat,
+                    "stat": wanted,
                     "line": line,
                     "curr": value,
+                }
+            )
+    return rows
+
+
+def first_scorer_tokens(
+    markets: list[dict[str, Any]],
+    *,
+    home: str,
+    away: str,
+    first_side: str | None,
+) -> list[dict[str, Any]]:
+    """Settle "Team to Score First" tokens from the first scoring side.
+
+    `first_side` is "home"/"away" as recorded by the first non-zero DQD score
+    event of the match. The full-game winner is unrelated to this bet, so an
+    unknown first side yields PENDING rather than a guessed WIN.
+    """
+    nh, na = _norm_name(home), _norm_name(away)
+    rows: list[dict[str, Any]] = []
+
+    def _role(label: str) -> str | None:
+        nt = _norm_name(label)
+        if not nt:
+            return None
+        if nh and nt == nh:
+            return "home"
+        if na and nt == na:
+            return "away"
+        return None
+
+    for m in markets:
+        smt = (m.get("sports_market_type") or "").strip().lower()
+        q = str(m.get("question") or "")
+        if smt != "basketball_team_to_score_first" and "score first" not in q.lower():
+            continue
+        outcomes = list(m.get("outcomes") or [])
+        tokens = list(m.get("clob_token_ids") or [])
+        if len(tokens) < 2:
+            continue
+        for i, token in enumerate(tokens[:2]):
+            label = str(outcomes[i]) if i < len(outcomes) else f"outcome_{i}"
+            role = _role(label)
+            if role is None:
+                continue
+            if first_side in ("home", "away"):
+                settlement = "WIN" if role == first_side else "LOSE"
+            else:
+                # Unknown first scorer: never guess. PENDING keeps the leg out
+                # of flag_misprice (it only prices WIN legs).
+                settlement = "PENDING"
+            rows.append(
+                {
+                    "family": "moneyline",
+                    "market_key": f"score_first_{role}_yes",
+                    "role": role,
+                    "outcome": label,
+                    "settlement": settlement,
+                    "token_id": token,
+                    "market_id": m.get("market_id") or "",
+                    "condition_id": m.get("condition_id") or "",
+                    "question": q,
+                    "sports_market_type": "basketball_team_to_score_first",
+                    "first_side": first_side,
                 }
             )
     return rows
@@ -556,6 +756,93 @@ def _parse_spread(market: dict[str, Any]) -> tuple[str, float] | None:
     return None
 
 
+_PERIOD_RE = re.compile(r"\b(1Q|2Q|3Q|4Q|1H|2H)\b", re.I)
+
+
+def _spread_period(market: dict[str, Any]) -> str:
+    """Map a spread market to its scoring period: ft / 1q..4q / 1h / 2h.
+
+    Gamma encodes the period both in the question ("4Q Spread: ...") and in
+    sports_market_type ("q4_spreads", "first_half_spreads"). Using the full
+    game margin for a period market settles the wrong bet, so anything we
+    cannot map is reported as "" and skipped by the caller.
+    """
+    smt = (market.get("sports_market_type") or "").strip().lower()
+    if smt.startswith("q") and "spread" in smt:
+        m = re.match(r"q([1-4])", smt)
+        if m:
+            return f"{m.group(1)}q"
+    if "first_half" in smt or "1h" in smt:
+        return "1h"
+    if "second_half" in smt or "2h" in smt:
+        return "2h"
+    if "quarter" in smt or "period" in smt:
+        m = re.search(r"([1-4])", smt)
+        if m:
+            return f"{m.group(1)}q"
+    q = str(market.get("question") or "")
+    m = _PERIOD_RE.search(q)
+    if m:
+        return m.group(1).lower()
+    return "ft"
+
+
+def _period_score(
+    period: str,
+    *,
+    home_score: Any,
+    away_score: Any,
+    home_fs_4: Any = None,
+    away_fs_4: Any = None,
+) -> tuple[int, int] | None:
+    """Return (home, away) points scored in `period`, or None if unknown."""
+    h = _parse_int_score(home_score)
+    a = _parse_int_score(away_score)
+    if h is None or a is None:
+        return None
+    if period == "ft":
+        return h, a
+    hs = _quarter_list(home_fs_4)
+    as_ = _quarter_list(away_fs_4)
+    if period in ("1q", "2q", "3q", "4q"):
+        idx = int(period[0]) - 1
+        if len(hs) <= idx or len(as_) <= idx:
+            return None
+        return hs[idx], as_[idx]
+    if period in ("1h", "2h"):
+        if len(hs) < 2 or len(as_) < 2:
+            return None
+        if period == "1h":
+            return hs[0] + hs[1], as_[0] + as_[1]
+        return sum(hs[2:]), sum(as_[2:])
+    return None
+
+
+def _quarter_list(value: Any) -> list[int]:
+    """Parse DQD fs_4 ("[33, 33, 34, 30]") or "33,33,34,30" into ints."""
+    if value is None or value == "":
+        return []
+    items = value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                items = json.loads(text)
+            except json.JSONDecodeError:
+                items = []
+        else:
+            items = [p for p in re.split(r"[,\s]+", text) if p]
+    if not isinstance(items, (list, tuple)):
+        return []
+    out: list[int] = []
+    for item in items:
+        n = _parse_int_score(item)
+        if n is None:
+            return []
+        out.append(n)
+    return out
+
+
 def spread_tokens(
     markets: list[dict[str, Any]],
     *,
@@ -563,12 +850,9 @@ def spread_tokens(
     away: str,
     home_score: Any,
     away_score: Any,
+    home_fs_4: Any = None,
+    away_fs_4: Any = None,
 ) -> list[dict[str, Any]]:
-    try:
-        h, a = int(home_score), int(away_score)
-    except (TypeError, ValueError):
-        return []
-    margin = h - a
     rows: list[dict[str, Any]] = []
     for m in markets:
         smt = (m.get("sports_market_type") or "").lower()
@@ -578,6 +862,19 @@ def spread_tokens(
                 continue
         if not parsed:
             continue
+        period = _spread_period(m)
+        score = _period_score(
+            period,
+            home_score=home_score,
+            away_score=away_score,
+            home_fs_4=home_fs_4,
+            away_fs_4=away_fs_4,
+        )
+        if score is None:
+            # No per-period score: never fall back to the full-game margin.
+            continue
+        h, a = score
+        margin = h - a
         fav_team, line = parsed
         # Handicap applies to favorite team named in "Spread: Team (line)"
         # If line is -1.5 on home, home covers when margin > 1.5
@@ -601,7 +898,11 @@ def spread_tokens(
             rows.append(
                 {
                     "family": "spreads",
-                    "market_key": f"spread_{_norm_name(fav_team)}_{line}_{i}",
+                    "market_key": (
+                        f"spread_{_norm_name(fav_team)}_{line}_{i}"
+                        if period == "ft"
+                        else f"spread_{period}_{_norm_name(fav_team)}_{line}_{i}"
+                    ),
                     "role": "spread",
                     "outcome": label,
                     "settlement": settlement,
@@ -612,6 +913,8 @@ def spread_tokens(
                     "sports_market_type": "spreads",
                     "line": line,
                     "favorite": fav_team,
+                    "period": period,
+                    "period_margin": margin,
                 }
             )
     return rows
@@ -654,7 +957,18 @@ def _parse_total_market(
     team_blob = TOTAL_RE.sub("", suffix)
     team_blob = HALF_1_RE.sub("", team_blob)
     team_blob = HALF_2_RE.sub("", team_blob)
+    team_blob = TEAM_TOTAL_RE.sub("", team_blob)
     team_blob = team_blob.strip(" :-")
+
+    if TEAM_TOTAL_RE.search(q) and not team_blob:
+        # "Pacers 1H Team Total: O/U 53.5" names the team before the colon.
+        # Without that team this market cannot be settled as a match total.
+        prefix = q.rsplit(":", 1)[0].split(":")[-1]
+        prefix = HALF_1_RE.sub("", prefix)
+        prefix = HALF_2_RE.sub("", prefix)
+        team_blob = TEAM_TOTAL_RE.sub("", prefix).strip(" :-")
+        if not team_blob or re.search(r"\bvs\.?\b", team_blob, re.I):
+            return None
 
     side = "match"
     if team_blob:
@@ -1190,7 +1504,7 @@ def flag_misprice(
     """Return (is_opp, reason, economics).
 
     Only flag opportunities whose net edge after sports taker fee covers
-    `min_net` (default 0.02 USDC/share). Economics always filled when priced.
+    `min_net` (default 0.0045 USDC/share). Economics always filled when priced.
     """
     meta: dict[str, Any] = {
         "fee_rate": fee_rate,
@@ -1312,6 +1626,7 @@ def load_bridge_quote_events(
     root: Path,
     *,
     byte_offset: int | None = None,
+    max_bytes: int = 4 * 1024 * 1024,
 ) -> tuple[list[dict[str, Any]], int]:
     """Load score_change + match_finished events for quoting.
 
@@ -1338,24 +1653,34 @@ def load_bridge_quote_events(
         return rows, size
     try:
         with path.open("rb") as f:
+            f.seek(start)
+            # A retention rewrite can leave the old byte cursor inside a line
+            # even when the rewritten file is still larger than the cursor.
             if start:
-                f.seek(start)
-            raw = f.read().decode("utf-8", errors="replace")
+                f.seek(start - 1)
+                if f.read(1) != b"\n":
+                    f.readline()
+            batch_start = f.tell()
+            while f.tell() - batch_start < max_bytes:
+                pos = f.tell()
+                line = f.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    # The writer has not finished this line. Retry it next tick.
+                    f.seek(pos)
+                    break
+                try:
+                    ev = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(ev, dict) and ev.get("type") in (
+                    "match_finished", "score_change", "player_stat_change"
+                ):
+                    rows.append(ev)
             new_off = f.tell()
     except OSError:
         return rows, start
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(ev, dict) and ev.get("type") in (
-            "match_finished", "score_change", "player_stat_change"
-        ):
-            rows.append(ev)
     return rows, int(new_off)
 
 
@@ -1389,6 +1714,25 @@ def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
         dqd["home_score"] = hs
     if aws is not None:
         dqd["away_score"] = aws
+    # Per-quarter splits are only carried on score_change events and on the
+    # bridge snapshot, never on the slim match_finished event.
+    home_q = away_q = None
+    fs4 = ev.get("fs_4")
+    if isinstance(fs4, dict):
+        home_q, away_q = fs4.get("home"), fs4.get("away")
+    if not _quarter_list(home_q) or not _quarter_list(away_q):
+        snapshot_row = _bridge_snapshot_match(root, mid)
+        if snapshot_row:
+            home_q = home_q if _quarter_list(home_q) else snapshot_row.get("home_fs_4")
+            away_q = away_q if _quarter_list(away_q) else snapshot_row.get("away_fs_4")
+    if not _quarter_list(home_q) or not _quarter_list(away_q):
+        box_home, box_away = _boxscore_quarter_scores(root, mid)
+        home_q = home_q if _quarter_list(home_q) else box_home
+        away_q = away_q if _quarter_list(away_q) else box_away
+    if _quarter_list(home_q):
+        dqd["home_fs_4"] = home_q
+    if _quarter_list(away_q):
+        dqd["away_fs_4"] = away_q
     return {
         "event": ev,
         "match_row": row,
@@ -1399,6 +1743,110 @@ def join_ft_context(root: Path, ev: dict[str, Any]) -> dict[str, Any]:
         "home": ev.get("home") or pm.get("home") or dqd.get("home") or "",
         "away": ev.get("away") or pm.get("away") or dqd.get("away") or "",
     }
+
+
+def _bridge_snapshot_match(root: Path, match_id: str) -> dict[str, Any] | None:
+    """Latest DQD snapshot row (keeps fs_4) for one match."""
+    if not match_id:
+        return None
+    # dqd_match writes the full snapshot (with per-quarter splits) here.
+    snap = load_json(root / "data" / "snapshot.json", {}) or {}
+    for m in snap.get("matches") or []:
+        if str(m.get("id") or "") == match_id:
+            return m
+    return None
+
+
+def _boxscore_quarter_scores(root: Path, match_id: str) -> tuple[list[int], list[int]]:
+    """Rebuild per-quarter splits from the saved boxscore player rows.
+
+    The daily snapshot only lists the current match day, so an older match that
+    still has trades falls back to its saved boxscore (q1..q4 player splits).
+    """
+    if not match_id:
+        return [], []
+    raw = load_json(root / "data" / "boxscores" / f"{match_id}.json", None)
+    if not isinstance(raw, dict):
+        return [], []
+    home: list[int] = [0, 0, 0, 0]
+    away: list[int] = [0, 0, 0, 0]
+    found = False
+    for side, bucket in (("team_A", home), ("team_B", away)):
+        for p in (raw.get(side) or {}).get("players") or []:
+            for i, key in enumerate(("q1_score", "q2_score", "q3_score", "q4_score")):
+                n = _parse_int_score(p.get(key))
+                if n is not None:
+                    bucket[i] += n
+                    found = True
+    if not found:
+        return [], []
+    return home, away
+
+
+def first_scorer_side(root: Path, ev: dict[str, Any]) -> str | None:
+    """First team to score in this match: "home" / "away" / None.
+
+    Uses the cached index, then the ev 0-0 transition, then a scan of the
+    retained events.jsonl. A match with no observable first score stays
+    unknown so its market settles PENDING instead of guessed.
+    """
+    mid = str(ev.get("match_id") or "")
+    if not mid:
+        return None
+    path = data_dir(root) / "first_scorer.json"
+    index = load_json(path, {}) or {}
+    known = index.get(mid)
+    if known in ("home", "away"):
+        return known
+    side = _first_side_from_event(ev) or _scan_first_side(root, mid)
+    if side:
+        index[mid] = side
+        try:
+            write_json(path, index)
+        except OSError:
+            pass
+    return side
+
+
+def _first_side_from_event(ev: dict[str, Any]) -> str | None:
+    """First scorer from a single 0-0 -> X score_change event."""
+    if str(ev.get("type") or "") != "score_change":
+        return None
+    prev = ev.get("prev") if isinstance(ev.get("prev"), dict) else {}
+    curr = ev.get("curr") if isinstance(ev.get("curr"), dict) else {}
+    ph, pa = _parse_int_score(prev.get("home")), _parse_int_score(prev.get("away"))
+    ch, ca = _parse_int_score(curr.get("home")), _parse_int_score(curr.get("away"))
+    if None in (ph, pa, ch, ca) or (ph, pa) != (0, 0):
+        return None
+    if ch > 0 and ca == 0:
+        return "home"
+    if ca > 0 and ch == 0:
+        return "away"
+    return None
+
+
+def _scan_first_side(root: Path, match_id: str) -> str | None:
+    """Scan retained bridge events for the first 0-0 -> X transition."""
+    path = bridge_dir(root) / "events.jsonl"
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if match_id not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(row.get("match_id") or "") != match_id:
+                    continue
+                side = _first_side_from_event(row)
+                if side:
+                    return side
+    except OSError:
+        return None
+    return None
 
 
 def markets_from_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1425,6 +1873,7 @@ def markets_from_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def collect_target_tokens(
     ctx: dict[str, Any],
     *,
+    root: Path | None = None,
     proxy: str | None | object = ...,
     include_props: bool = True,
     include_exact: bool = True,
@@ -1504,6 +1953,16 @@ def collect_target_tokens(
     if mode == "ft":
         tokens.extend(
             moneyline_tokens(main_markets, home=home, away=away, home_score=hs, away_score=aws)
+        )
+        tokens.extend(
+            first_scorer_tokens(
+                main_markets,
+                home=home,
+                away=away,
+                first_side=(
+                    first_scorer_side(root, ctx.get("event") or {}) if root is not None else None
+                ),
+            )
         )
         ml_n = len([t for t in tokens if t["family"] == "moneyline"])
         # Two-way team-name markets yield 2 tokens; legacy Yes/No yields up to 4.
@@ -1615,7 +2074,13 @@ def collect_target_tokens(
             if mode == "ft":
                 tokens.extend(
                     spread_tokens(
-                        prop_markets, home=home, away=away, home_score=hs, away_score=aws
+                        prop_markets,
+                        home=home,
+                        away=away,
+                        home_score=hs,
+                        away_score=aws,
+                        home_fs_4=dqd.get("home_fs_4"),
+                        away_fs_4=dqd.get("away_fs_4"),
                     )
                 )
             tokens.extend(
@@ -1762,6 +2227,25 @@ def quote_tokens(
             for fut in as_completed(futs):
                 priced[futs[fut]]["trade_attempt"] = fut.result()
 
+    # A rest bid is a separate choice for a locally settled WIN token when
+    # the current ask cannot be taken at or below the 0.995 FAK ceiling.
+    if trade_executor is not None:
+        for item in priced:
+            if str(item.get("settlement") or "") != "WIN":
+                continue
+            try:
+                rest = trade_executor.offer_rest_buy(
+                    item, event_key=event_key_str, match_meta=match_meta,
+                )
+                if rest:
+                    item["rest_attempt"] = {
+                        "status": rest.get("status"),
+                        "success": rest.get("success"),
+                        "skip_reason": rest.get("skip_reason"),
+                    }
+            except Exception as e:  # noqa: BLE001
+                item["rest_attempt"] = {"status": "error", "skip_reason": str(e)}
+
     books_ms = int((time.monotonic() - t0) * 1000) if books is not None else None
     if books_ms is not None:
         for item in priced:
@@ -1885,6 +2369,7 @@ def quote_bridge_event(
     mode = "live" if ev.get("type") in ("score_change", "player_stat_change") else "ft"
     tokens, discovery = collect_target_tokens(
         ctx,
+        root=root,
         proxy=proxy,
         include_props=include_props,
         include_exact=include_exact,
@@ -1936,10 +2421,10 @@ def quote_bridge_event(
             )
         discovery["player_stat"] = {"player": player, "curr": curr}
     elif ev.get("type") == "match_finished" and include_props and prop_markets:
-        # Settle all remaining player props from final boxscore (Over + Under).
-        box = ev.get("box") if isinstance(ev.get("box"), dict) else None
-        if not box:
-            box = _load_final_box(root, str(ev.get("match_id") or ""))
+        # The event's embedded box and saved boxscore may still say Playing.
+        # Fetch the lineup again after FT and require its own final status.
+        box, box_status = _load_final_box(root, str(ev.get("match_id") or ""))
+        discovery["ft_boxscore_status"] = box_status
         prop_rows: list[dict[str, Any]] = []
         if isinstance(box, dict):
             for _pid, player in box.items():
@@ -1954,18 +2439,19 @@ def quote_bridge_event(
                 for stat_key in ("score", "assist", "rebound", "steal", "block", "three_point"):
                     if player.get(stat_key) is None:
                         continue
-                    prop_rows.extend(
-                        player_prop_tokens(
+                    for prop_row in player_prop_tokens(
                             prop_markets,
                             player=pname,
                             stat=stat_key,
                             curr=player.get(stat_key),
                             mode="ft",
-                        )
-                    )
+                        ):
+                        prop_rows.append({**prop_row, "ft_boxscore_final_fresh": True})
         if prop_rows:
             tokens.extend(prop_rows)
             discovery["ft_player_props"] = len(prop_rows)
+        elif box_status != "played":
+            discovery["ft_player_props_skipped"] = "fresh_boxscore_not_final"
     n_before = len(tokens)
     tokens = tradeable_token_rows(tokens)
     discovery["skipped_lose_tokens"] = max(0, n_before - len(tokens))
@@ -2011,6 +2497,20 @@ def quote_bridge_event(
         quotes = quote_tokens(tokens, **quote_kw)
         latency_ms["books_and_trade"] = int((time.monotonic() - t_books) * 1000)
     discovery["latency_ms"] = latency_ms
+    if ev.get("type") == "score_change":
+        append_jsonl_async(data_dir(root) / "prefilter.jsonl", [{
+            "ts": now_cn_iso(), "event_key": ek,
+            "match_id": match_meta["match_id"],
+            "score": [ctx["home_score"], ctx["away_score"]],
+            "candidate_count": len(tokens),
+            "candidates": [{
+                "token_id": q.get("token_id"), "family": q.get("family"),
+                "market_key": q.get("market_key"),
+                "best_ask": q.get("best_ask"), "net_edge": q.get("net_edge"),
+                "trade_attempt": q.get("trade_attempt"),
+                "rest_attempt": q.get("rest_attempt"),
+            } for q in quotes],
+        }])
     bundle = build_bundle(ctx, quotes, discovery)
     bundle["trigger"] = str(ev.get("type") or "")
     bundle["event_key"] = ek
@@ -2020,25 +2520,29 @@ def quote_bridge_event(
     return bundle
 
 
-def _load_final_box(root: Path, match_id: str) -> dict[str, Any]:
-    """Load last DQD boxscore players keyed by person_id, if present."""
+def _load_final_box(root: Path, match_id: str) -> tuple[dict[str, Any], str]:
+    """Fetch DQD after FT; never settle player props from a Playing snapshot."""
     if not match_id:
-        return {}
-    path = root / "data" / "boxscores" / f"{match_id}.json"
-    raw = load_json(path, None)
-    if not isinstance(raw, dict):
-        return {}
+        return {}, "missing_match_id"
     try:
         dqd_scripts = Path(__file__).resolve().parents[2] / "dongqiudi-basketball" / "scripts"
         if str(dqd_scripts) not in sys.path:
             sys.path.insert(0, str(dqd_scripts))
         import dqd_lib as dqd  # type: ignore
 
+        raw = dqd.fetch_boxscore(match_id)
+        data = raw.get("data") if isinstance(raw, dict) else None
+        if not isinstance(data, dict):
+            data = raw if isinstance(raw, dict) else {}
+        base = data.get("base") or {}
+        status = str(base.get("status") or "").strip().lower()
+        if status not in {"played", "finished", "final", "ft"}:
+            return {}, status or "missing_status"
         players = dqd.extract_player_stats(raw)
         dqd.apply_english_person_names(players)
-        return players if isinstance(players, dict) else {}
+        return (players if isinstance(players, dict) else {}), status
     except Exception:  # noqa: BLE001
-        return {}
+        return {}, "fetch_failed"
 
 
 def quote_finished_event(
@@ -2168,6 +2672,8 @@ def _process_basketball_events(
                 ev["home_score"] = curr.get("home")
             if ev.get("away_score") is None and curr.get("away") is not None:
                 ev["away_score"] = curr.get("away")
+            if typ == "match_finished" and trade_executor is not None:
+                trade_executor.cancel_rest_orders(mid)
             if typ == "score_change" and (
                 bool(ev.get("is_reversal"))
                 or any(
@@ -2178,6 +2684,7 @@ def _process_basketball_events(
             ):
                 flattened = []
                 if trade_executor is not None:
+                    trade_executor.cancel_rest_orders(mid)
                     flattened = list(trade_executor.maybe_flatten_for_event(ev) or [])
                 bundles.append(
                     {
@@ -2220,14 +2727,32 @@ def _process_basketball_events(
                         "error": str(exc),
                     }
                 )
-                if key in file_keys:
+                # These player events lack both scores and cannot be settled.
+                # Retrying one forever pins the byte cursor and replays every
+                # later event, eventually exhausting memory.
+                invalid_player_score = (
+                    typ == "player_stat_change"
+                    and isinstance(exc, QuoteError)
+                    and str(exc) == "missing home_score/away_score on event"
+                )
+                if invalid_player_score:
+                    seen.add(key)
+                elif key in file_keys:
                     file_progress_ok = False
 
-    if file_progress_ok:
+    # The watch loop calls this up to 4x/s. Rewriting the whole cursor when
+    # nothing moved was constant background I/O; persist only on change.
+    changed = False
+    if file_progress_ok and int(cursor.get("events_byte_offset") or 0) != new_offset:
         cursor["events_byte_offset"] = new_offset
-    cursor["processed_keys"] = sorted(seen)[-1000:]
-    cursor["updated_at"] = now_cn_iso()
-    save_cursor(root, cursor)
+        changed = True
+    keys = sorted(seen)[-1000:]
+    if keys != list(cursor.get("processed_keys") or []):
+        cursor["processed_keys"] = keys
+        changed = True
+    if changed:
+        cursor["updated_at"] = now_cn_iso()
+        save_cursor(root, cursor)
     return bundles
 
 
