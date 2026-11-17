@@ -15,6 +15,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -461,7 +462,8 @@ class PostGoalSampler:
         if not path.is_file():
             return None, None, None, None
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()[-2000:]
+            with path.open(encoding="utf-8") as events:
+                lines = deque(events, maxlen=2000)
         except OSError:
             return None, None, None, None
         hs = aws = None
@@ -499,7 +501,8 @@ class PostGoalSampler:
         if not path.is_file():
             return empty
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()[-3000:]
+            with path.open(encoding="utf-8") as events:
+                lines = deque(events, maxlen=3000)
         except OSError:
             return empty
 

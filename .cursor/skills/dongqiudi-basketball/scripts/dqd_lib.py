@@ -664,6 +664,9 @@ def detect_score_changes(
                     "curr": {"home": curr_h, "away": curr_a},
                     "home_score": curr_h,
                     "away_score": curr_a,
+                    # Keep the per-quarter split: period spreads (1Q/1H/4Q)
+                    # settle from these and must never use the game margin.
+                    "fs_4": {"home": m.get("home_fs_4", ""), "away": m.get("away_fs_4", "")},
                     "period": "FT",
                     "tab": tab,
                     "emit_downstream": True,
@@ -745,10 +748,20 @@ _STAT_KEYS = {
     "assist": ("assist", "assists", "ast"),
     "steal": ("steal", "steals", "stl"),
     "block": ("block", "blocks", "blk"),
+    # DQD reports threes as a made-attempted pair ("2-5"); _number reads the
+    # made count so player threes props can settle from the same boxscore.
+    "three_point": ("three_point", "threes", "three_pointers"),
 }
 
 
 def _number(value: Any) -> int | None:
+    """Parse a count, including DQD's "made-attempted" pair ("2-5" -> 2)."""
+    if isinstance(value, str) and "-" in value.strip():
+        head = value.strip().split("-", 1)[0].strip()
+        try:
+            return int(float(head))
+        except ValueError:
+            return None
     try:
         return int(float(value))
     except (TypeError, ValueError):
