@@ -27,3 +27,8 @@ venv/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+
+# Local edit backups kept for rollback only
+*.bak
+*.bak.*
+*.bak_*

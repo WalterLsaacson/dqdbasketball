@@ -1,0 +1,25 @@
+[Unit]
+Description=Dongqiudi basketball quote and dashboard (dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/workspace/dqdbasketball
+Environment=PYTHONUNBUFFERED=1
+Environment=PM_PROXY=none
+Environment=QUOTE_LIVE=0
+Environment=QUOTE_SCORE_MODE=dry
+Environment=QUOTE_PROP_MODE=dry
+Environment=QUOTE_FT_MODE=dry
+Environment=QUOTE_SCORE_SOURCE=dqd
+Environment=QUOTE_FLATTEN_FLOOR_PCT=0.80
+ExecStart=/root/workspace/dqdbasketball/.venv/bin/python frontend/run_main.py --no-browser --score-mode dry --prop-mode dry --ft-mode dry
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
