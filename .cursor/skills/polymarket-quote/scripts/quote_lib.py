@@ -2593,6 +2593,7 @@ def process_bridge_events(
     af_referee: Any | None = None,
     af_mode: str = "gate",
     events_override: list[dict[str, Any]] | None = None,
+    score_source: str = "dqd",
 ) -> list[dict[str, Any]]:
     # Basketball path: DQD events are authoritative.  The legacy AF implementation
     # remains below only as inert compatibility code for old saved sessions.
@@ -2608,6 +2609,7 @@ def process_bridge_events(
         trade_executor=trade_executor,
         market_cache=market_cache,
         events_override=events_override,
+        score_source=score_source,
     )
 
 
@@ -2633,6 +2635,7 @@ def _process_basketball_events(
     trade_executor: Any | None,
     market_cache: Any | None,
     events_override: list[dict[str, Any]] | None,
+    score_source: str,
 ) -> list[dict[str, Any]]:
     """Process trusted DQD basketball events, serialized per match."""
     cursor = load_cursor(root)
@@ -2649,6 +2652,8 @@ def _process_basketball_events(
     offset = int(cursor.get("events_byte_offset") or 0)
     file_events, new_offset = load_bridge_quote_events(root, byte_offset=offset)
     events.extend(ev for ev in file_events if event_key(ev) not in override_keys)
+    if score_source == "nami_http":
+        events = [ev for ev in events if ev.get("type") != "score_change" or ev.get("source") == "nami_http"]
     file_keys = {event_key(ev) for ev in file_events if isinstance(ev, dict)}
     # Only advance the durable byte cursor when every newly-read file event
     # either succeeds or is already in ``seen``. A failure keeps the old offset

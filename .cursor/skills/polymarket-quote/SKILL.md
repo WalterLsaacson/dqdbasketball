@@ -63,6 +63,13 @@ channel flags override it:
 - Quotes: `data/pm-quote/quotes.jsonl`
 - Trade attempts and flattening: `data/pm-quote/trades.jsonl`
 - Open lots: `data/pm-quote/open_positions.json`
+- Local score prefilter audit: `data/pm-quote/prefilter.jsonl`
+- Optional Nami score audit: `data/pm-quote/nami_events.jsonl`
+
+The watch loop reconciles 0.99 GTC rest bids and lists eligible, confirmed
+inventory at 0.999 when the CLOB tick is 0.001. Reversal flatten uses an
+entry-cost floor (`QUOTE_FLATTEN_FLOOR_PCT`, default 0.80). The deployed hk1
+service stays dry-run; see `deploy/README.md` for its configuration.
 
 Install live-trading dependencies once:
 

@@ -161,6 +161,29 @@ def _score(side: dict[str, Any], is_fixture: bool) -> int | None:
         return 0
 
 
+def nami_id_from_match(raw: dict[str, Any]) -> str:
+    """Use a tracker URL in DQD metadata when the list response includes one."""
+    def walk(value: Any, depth: int = 0) -> str:
+        if depth > 4:
+            return ""
+        if isinstance(value, str) and "namitiyu.com" in value:
+            parsed = urllib.parse.urlparse(value)
+            candidate = (urllib.parse.parse_qs(parsed.query).get("id") or [""])[0]
+            return str(candidate) if str(candidate).isdigit() else ""
+        if isinstance(value, dict):
+            for key in ("animation_live", "animation", "living", "url", "link"):
+                result = walk(value.get(key), depth + 1)
+                if result:
+                    return result
+        if isinstance(value, list):
+            for item in value:
+                result = walk(item, depth + 1)
+                if result:
+                    return result
+        return ""
+    return walk(raw)
+
+
 def map_match(raw: dict[str, Any]) -> dict[str, Any]:
     team_a = raw.get("team_A") or {}
     team_b = raw.get("team_B") or {}
@@ -178,6 +201,7 @@ def map_match(raw: dict[str, Any]) -> dict[str, Any]:
 
     m = {
         "id": str(raw.get("match_id") or ""),
+        "nami_id": nami_id_from_match(raw),
         "cmp_type": "basketball",
         "league_id": str(comp.get("id") or ""),
         "league": comp.get("name") or "Unknown",

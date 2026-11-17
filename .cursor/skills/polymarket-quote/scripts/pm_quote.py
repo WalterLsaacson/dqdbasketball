@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ import data_prune  # noqa: E402
 import market_cache as mcache  # noqa: E402
 import quote_lib as lib  # noqa: E402
 from post_goal_sampler import PostGoalSampler  # noqa: E402
+from nami_basketball import NamiScorePoller  # noqa: E402
 from trade_executor import TradeExecutor  # noqa: E402
 from trade_settings import load_trade_settings, resolve_live_modes, size_tiers_label  # noqa: E402
 
@@ -85,7 +87,7 @@ def build_executor(args: argparse.Namespace, rt: Path) -> TradeExecutor | None:
         f"trade → score={s} props={p} ft={f} take_depth={settings.take_depth} "
         f"max_usdc={settings.max_usdc} max_shares={settings.max_shares} "
         f"min_buy_price={settings.min_buy_price} "
-        f"max_open_usdc={settings.max_open_usdc} "
+        f"max_market_usdc={settings.max_market_usdc} "
         f"size_tiers={size_tiers_label(settings)}",
         file=sys.stderr,
         flush=True,
@@ -269,9 +271,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
     sig = mcache.file_signature(events_path)
     owned = lib.get_owned_bridge()
     first_tick = True
+    last_order_maintenance = 0.0
     # 0.0 makes the first tick trim: a restart on a bloated log reclaims
     # space immediately instead of waiting a full trim interval.
     last_bridge_trim = 0.0
+    score_source = os.getenv("QUOTE_SCORE_SOURCE", "dqd").strip().lower()
+    if score_source not in ("dqd", "nami_http"):
+        raise ValueError(f"unsupported QUOTE_SCORE_SOURCE={score_source!r}")
+    nami_poller = NamiScorePoller() if score_source == "nami_http" else None
     try:
         while True:
             mem_events: list = []
@@ -283,6 +290,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         events_path, sig, timeout_s=interval, poll_s=0.05
                     )
             first_tick = False
+
+            if nami_poller is not None:
+                nami_events = nami_poller.poll(lib.load_bridge_matches(rt))
+                if nami_events:
+                    lib.append_jsonl_async(lib.data_dir(rt) / "nami_events.jsonl", nami_events)
+                    mem_events.extend(nami_events)
 
             bundles = lib.process_bridge_events(
                 rt,
@@ -296,6 +309,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 trade_executor=executor,
                 market_cache=cache,
                 events_override=mem_events if mem_events else None,
+                score_source=score_source,
             )
             # Trim the bridge log from the consumer side, after the cursor was
             # saved by process_bridge_events: only this thread knows which
@@ -308,14 +322,26 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     trim = data_prune.prune_bridge_consumed(rt)
                     if trim.get("pruned"):
                         print(
-                            f"bridge log -> {'rotated' if trim.get('rotated') else 'trimmed'} "
+                            f"bridge log → {'rotated' if trim.get('rotated') else 'trimmed'} "
                             f"prefix={int(trim.get('removed_bytes') or 0) / 1024**2:.1f}MB "
-                            f"live={int(trim.get('live_bytes') or 0) / 1024**2:.1f}MB",
+                            f"live={int(trim.get('live_bytes') or 0) / 1024**2:.1f}MB"
+                            + (
+                                f" archive={os.path.basename(str(trim.get('archive')))}"
+                                if trim.get("rotated")
+                                else ""
+                            ),
                             file=sys.stderr,
                             flush=True,
                         )
                 except Exception as exc:  # noqa: BLE001
                     print(f"bridge log trim failed: {exc}", file=sys.stderr, flush=True)
+            if executor is not None and time.monotonic() - last_order_maintenance >= 2.0:
+                try:
+                    executor.reconcile_rest_orders()
+                    executor.offer_exit_sells()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"order maintenance failed: {exc}", file=sys.stderr, flush=True)
+                last_order_maintenance = time.monotonic()
             for b in bundles:
                 lat = b.get("latency_ms") or {}
                 lat_s = ""
